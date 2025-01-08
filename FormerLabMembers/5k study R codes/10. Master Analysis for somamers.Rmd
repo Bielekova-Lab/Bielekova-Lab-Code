@@ -1,0 +1,1513 @@
+---
+title: "Masterspreadsheet of somamers in 5k dataset"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  html_notebook: default
+---
+
+THIS SCRIPT generates a masterspreadsheet of age/sex-adjusted somamers 
+
+with 3*IQR curbed to upper/lower limit 
+
+
+###################
+
+Set the environment 
+
+```{r}
+
+remove(list = ls())
+
+library(readr, quietly = TRUE)
+library(readxl, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(data.table, quietly = TRUE)
+library(foreach, quietly = TRUE)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(lme4)
+library(ggpubr)
+library(openxlsx)
+library(glmnet)
+library(tidyr)
+library(broom)
+library(REdaS)
+library(vioplot)
+library(epiR)
+library(broom)
+library(MatchIt)
+library(gridExtra)
+library(rstatix)
+
+```
+
+
+load functions
+
+```{r}
+'%notin%' <- function(x,y)!('%in%'(x,y))
+
+
+tsapply <- function(...){t(sapply(...))}
+
+
+ 
+cor_est <- function(x,y,...){
+  obj <- cor.test(x,y,...)
+  val <- obj$estimate
+  return(round(as.numeric(val),digits = 3))
+}
+cor_pval <- function(x,y,...){
+  obj <- cor.test(x,y,...)
+  pval <- obj$p.value
+  return(as.numeric(pval))
+}
+
+
+corr_fun <- function(dat,outcomes,high_markers,...){
+    dat_est <- sapply(outcomes,function(ychar){
+    sapply(high_markers,function(xchar){
+      cor_est(dat[[xchar]],dat[[ychar]],method="spearman")
+    })
+  })
+  
+ 
+  dat_pval <- sapply(outcomes,function(ychar){sapply(high_markers,function(xchar){
+    cor_pval(dat[[xchar]],dat[[ychar]],method="spearman")})})
+  
+  
+  dat_pval <- as_tibble(dat_pval) %>% 
+    mutate_all(p.adjust,method="fdr") %>%
+    mutate(marker = high_markers,type="p-value") %>%  
+    dplyr::select(marker,type,everything()) 
+  
+  dat_est <- as_tibble(dat_est) %>% 
+    mutate(marker = high_markers,type="spearman") %>% 
+    dplyr::select(marker,type,everything())
+  
+  dat_results <- bind_rows(dat_est,dat_pval) # stack em up
+  dat_results <- dat_results %>% 
+    gather(key,value,outcomes) 
+ 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    mutate(type=factor(type,levels=c("spearman","p-value"))) %>% 
+    arrange(marker,key,type) %>%    
+    mutate(key = paste(as.character(key),type)) %>% 
+    dplyr::select(-type) 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    spread(key,value) 
+  
+  
+  
+  return(dat_results)
+}
+
+corr_fun_nofdr <- function(dat,outcomes,high_markers,...){
+    dat_est <- sapply(outcomes,function(ychar){
+    sapply(high_markers,function(xchar){
+      cor_est(dat[[xchar]],dat[[ychar]],method="spearman")
+    })
+  })
+  
+ 
+  dat_pval <- sapply(outcomes,function(ychar){sapply(high_markers,function(xchar){
+    cor_pval(dat[[xchar]],dat[[ychar]],method="spearman")})})
+  
+  
+  dat_pval <- as_tibble(dat_pval) %>% 
+    # mutate_all(p.adjust,method="fdr") %>%
+    mutate(marker = high_markers,type="p-value") %>%  
+    dplyr::select(marker,type,everything()) 
+  
+  dat_est <- as_tibble(dat_est) %>% 
+    mutate(marker = high_markers,type="spearman") %>% 
+    dplyr::select(marker,type,everything())
+  
+  dat_results <- bind_rows(dat_est,dat_pval) # stack em up
+  dat_results <- dat_results %>% 
+    gather(key,value,outcomes) 
+ 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    mutate(type=factor(type,levels=c("spearman","p-value"))) %>% 
+    arrange(marker,key,type) %>%    
+    mutate(key = paste(as.character(key),type)) %>% 
+    dplyr::select(-type) 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    spread(key,value) 
+  
+  
+  
+  return(dat_results)
+}
+
+# generate patient-specific slope 
+
+get_patient_specific_coefficients <- function(df, subject_col, age_col, variables) {
+  # Create an empty list to store results
+  results_list <- list()
+
+  # Get unique subject IDs
+  subject_ids <- unique(df[[subject_col]])
+
+  total_subjects <- length(subject_ids)
+
+  # Loop over each subject
+  for (i in seq_along(subject_ids)) {
+    subject <- subject_ids[i]
+
+    # Print progress update
+    cat(sprintf("Processing subject %d of %d\n", i, total_subjects))
+
+    # Subset data for the current subject
+    subject_data <- df %>% filter(.[[subject_col]] == subject)
+
+    # Initialize a list to store coefficients for the current subject
+    subject_coeffs <- setNames(numeric(length(variables)), variables)
+
+    # Loop over each variable
+    for (var in variables) {
+      # Fit the linear model
+      model <- lm(as.formula(paste0("`",var,"`","~", age_col)), data = subject_data)
+
+      # Extract the age coefficient
+      if ("age" %in% names(coef(model))) {
+        subject_coeffs[var] <- coef(model)["age"]
+      } else {
+        subject_coeffs[var] <- NA
+      }
+    }
+
+    # Store the coefficients in the results list
+    results_list[[as.character(subject)]] <- subject_coeffs
+  }
+
+  # Combine results into a data frame
+  results_df <- do.call(rbind, lapply(results_list, as.data.frame))
+
+  # Add subject ID column
+  results_df <- cbind(Subject_ID = rownames(results_df), results_df)
+
+  return(results_df)
+}
+
+
+```
+
+Load data
+
+```{r}
+
+# load vector of high-signaling somamers
+
+markers <- readLines("./input/high_SNR_markers.txt")
+
+
+
+# load curbed dataset
+
+data <- fread("./input/soma_highSNR_adj_scaled_3_iqr_curbed.csv")
+
+
+
+# select only somamers of interest and only untreated MS and HD samples
+
+data <- data %>% 
+   filter(nice_therapy=="Untreated" & diagnosis %in% c("HD","RR-MS","SP-MS","PP-MS"))
+
+table(data$diagnosis)
+
+# generate additional variables
+to_plot <- data %>% 
+  mutate(cohort=diagnosis) %>% 
+  mutate_at(.vars = "cohort",.funs = function(x){ifelse(x=="HD",yes="HD",no="MS")})
+
+# add info about quartiles for different combinations
+
+#bd_t2
+bd_t2 <- read_csv("./input/bd_vs_t2_propensity_data.csv")
+bd_t2 <- bd_t2 %>% 
+  dplyr::select(sampleid,mark,subclass) %>% 
+  rename(bd_t2=mark) %>% 
+  rename(bd_t2_subclass=subclass)
+
+#t2_bd
+t2_bd <- read_csv("./input/t2_vs_bd_propensity_data.csv")
+t2_bd <- t2_bd %>% 
+  dplyr::select(sampleid,mark,subclass) %>% 
+  rename(t2_bd=mark)%>% 
+  rename(t2_bd_subclass=subclass)
+
+#bd_combi
+bd_combi <- read_csv("./input/bd_vs_combi_propensity_data.csv")
+bd_combi <- bd_combi %>% 
+  dplyr::select(sampleid,mark,subclass) %>% 
+  rename(bd_combi=mark)%>% 
+  rename(bd_combi_subclass=subclass)
+
+#combi_bd
+combi_bd <- read_csv("./input/combi_vs_bd_propensity_data.csv")
+combi_bd <- combi_bd %>% 
+  dplyr::select(sampleid,mark,subclass) %>% 
+  rename(combi_bd=mark)%>% 
+  rename(combi_bd_subclass=subclass)
+
+# add quartile info
+
+to_plot <- merge(to_plot,bd_t2,by="sampleid",all.x = TRUE)
+to_plot <- merge(to_plot,t2_bd,by="sampleid",all.x = TRUE)
+to_plot <- merge(to_plot,bd_combi,by="sampleid",all.x = TRUE)
+to_plot <- merge(to_plot,combi_bd,by="sampleid",all.x = TRUE)
+
+
+```
+
+
+```{r}
+# generate variable for DRB1 differences
+# clean up
+to_plot$drb1_15_01 <- 0
+to_plot$drb1_15_01[which(grepl(pattern = "*15:01",x = to_plot$DRB1_1))] <- 1
+
+to_plot$drb1_15_01_2 <- 0
+to_plot$drb1_15_01_2[which(grepl(pattern = "*15:01",x = to_plot$DRB1_2))] <- 1
+
+to_plot$drb1_15 <- to_plot$drb1_15_01 + to_plot$drb1_15_01_2
+
+
+# replace patients with unknown genotype with NA
+to_plot$drb1_15[which(is.na(to_plot$DRB1_1) & is.na(to_plot$DRB1_2))] <- NA
+
+table(to_plot$drb1_15)
+
+# class(to_plot$drb1_15)
+
+# turn DRB into factor
+to_plot$drb1_15_cat <- factor(x = to_plot$drb1_15,levels = c("0","1","2"))
+
+
+
+# generate variable for DRB1 differences (INCLUDING DRB1:15:03)
+
+# clean up
+to_plot$drb1_15_01_03 <- 0
+to_plot$drb1_15_01_03[which(grepl(pattern = "*15:01",x = to_plot$DRB1_1))] <- 1
+to_plot$drb1_15_01_03[which(grepl(pattern = "*15:03",x = to_plot$DRB1_1))] <- 1
+
+to_plot$drb1_15_01_03_2 <- 0
+to_plot$drb1_15_01_03_2[which(grepl(pattern = "*15:01",x = to_plot$DRB1_2))] <- 1
+to_plot$drb1_15_01_03_2[which(grepl(pattern = "*15:03",x = to_plot$DRB1_2))] <- 1
+
+to_plot$drb1_15_0103 <- to_plot$drb1_15_01_03 + to_plot$drb1_15_01_03_2
+
+
+# replace patients with unknown genotype with NA
+to_plot$drb1_15_0103[which(is.na(to_plot$DRB1_1) & is.na(to_plot$DRB1_2))] <- NA
+
+table(to_plot$drb1_15_0103)
+
+# class(to_plot$drb1_15)
+
+
+
+
+# add BMI info
+
+# add categorical BMI outcome  
+# clean up
+to_plot$bmi_cat2 <- NA
+
+to_plot$bmi_cat2[which(to_plot$bmi<30)] <- "normal"
+to_plot$bmi_cat2[which(to_plot$bmi>30)] <- "obese"
+
+table(to_plot$bmi_cat2)
+
+# turn BMI into factor
+to_plot$bmi_cat2 <- factor(x = to_plot$bmi_cat2,levels = c("normal","obese"))
+
+
+# smoking info
+# replace "past" and "current" with "yes"
+
+to_plot$smoking[which(to_plot$smoking %in% c("past","current"))] <- "yes"
+
+table(to_plot$smoking)
+length(unique(to_plot$patientcode))
+
+# turn smoking into factor
+to_plot$smoking <- factor(x = to_plot$smoking,levels = c("no","yes"))
+
+
+# calculate MS age residuals
+to_plot_age_residuals <- to_plot %>% 
+  filter(cohort=="MS") %>% 
+  dplyr::select(-all_of(markers))
+
+to_plot_msonly <- to_plot %>% 
+  filter(cohort=="MS")
+
+for(i in 1:length(markers)){
+
+    formula <- paste0("`",markers[i],"`~","age")
+    
+    mod <- lm(formula = formula,data = to_plot_msonly)
+    
+    to_plot_age_residuals[[markers[i]]]  <- mod$residuals
+  }
+
+
+table(to_plot$cohort)
+
+
+
+```
+
+####################################################################
+
+CORRELATIONS OF SOMAMERS WITH AGE AND PROGRESSION OUTCOMES
+
+####################################################################
+
+```{r}
+
+results <- tibble::enframe(markers,name = NULL,value = "seqid")
+
+# get translation file
+trans_5k <- read_excel("./input/translation file 5k new.xlsx")[,-1]
+
+# merge with results
+results <- left_join(results,trans_5k)
+
+# change "seqid" to "marker" for consistency in the script below
+names(results)[1] <- "marker"
+
+# generate HD and MS cohort
+
+data_all <- to_plot %>% 
+  filter(nice_therapy=="Untreated")
+
+# MS only
+
+data_ms <- data_all %>% 
+  filter(cohort=="MS")
+
+# HD only 
+data_hd <- data_all %>% 
+  filter(cohort=="HD")
+
+# MS Females only
+
+data_ms_f <- data_ms %>% 
+  filter(gender=="Female")
+
+# MS Males only
+
+data_ms_m <- data_ms %>% 
+  filter(gender=="Male")
+
+
+##############
+# correlation with age
+
+#HD
+suppressWarnings(
+corr_hd <- corr_fun(dat = data_hd,outcomes = "age",high_markers = markers)
+)
+
+names(corr_hd) <- c("marker","HD_age_Rho","HD_age_Rho_pval_FDR")
+
+results <- left_join(results,corr_hd)
+
+# rsqr
+outcome <- "age"
+dat <- data_hd
+wilc_p <- function(col_num){
+      # col_num <- 1
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]))
+      
+      p <- tibble::enframe(mod$r.squared,name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    # final$V1 <- p.adjust(final$V1,method = "fdr")
+    names(final)[2] <- "HD_age_Rsqr"
+    
+results <- left_join(results,final)
+
+
+
+
+#MS
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms,outcomes = "age",high_markers = markers)
+)
+
+names(corr_ms) <- c("marker","MS_age_Rho","MS_age_Rho_pval_FDR")
+
+results <- left_join(results,corr_ms)
+
+
+# rsqr
+outcome <- "age"
+dat <- data_ms
+wilc_p <- function(col_num){
+      # col_num <- 1
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]))
+      
+      p <- tibble::enframe(c(mod$r.squared,
+                           (-1*(mod$coefficients[1,1])/mod$coefficients[2,1])),
+                           name = NULL, value = markers[col_num])
+      
+        out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    # final$V1 <- p.adjust(final$V1,method = "fdr")
+    names(final) <- c("marker","MS_age_Rsqr","MS_age_at_score_0")
+    
+    
+    
+    
+    
+results <- left_join(results,final)
+
+
+
+#MS - Females
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms_f,outcomes = "age",high_markers = markers)
+)
+names(corr_ms) <- c("marker","MS_F_age_Rho","MS_F_age_Rho_pval_FDR")
+
+results <- left_join(results,corr_ms)
+
+
+# rsqr
+outcome <- "age"
+dat <- data_ms_f
+wilc_p <- function(col_num){
+      # col_num <- 1
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]))
+      
+      p <- tibble::enframe(mod$r.squared,name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    # final$V1 <- p.adjust(final$V1,method = "fdr")
+    names(final)[2] <- "MS_F_age_Rsqr"
+    
+results <- left_join(results,final)
+
+
+#MS - Males
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms_m,outcomes = "age",high_markers = markers)
+)
+names(corr_ms) <- c("marker","MS_M_age_Rho","MS_M_age_Rho_pval_FDR")
+
+results <- left_join(results,corr_ms)
+
+
+# rsqr
+outcome <- "age"
+dat <- data_ms_m
+wilc_p <- function(col_num){
+      # col_num <- 1
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]))
+      
+      p <- tibble::enframe(mod$r.squared,name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    # final$V1 <- p.adjust(final$V1,method = "fdr")
+    names(final)[2] <- "MS_M_age_Rsqr"
+    
+results <- left_join(results,final)
+
+
+###################################################
+#
+#.  NFL CEL residuals correlations
+#
+###################################################
+
+# add NFL CEL residuals to the data 
+
+nfl_res <- read_csv("./input/nfl_cel_residuals.csv")
+
+nfl_res <- nfl_res[,c("sampleid","NFL_CEL_residuals")]
+
+data_ms <- left_join(data_ms,nfl_res)
+
+
+# correlate with somamers
+suppressWarnings(
+corr_nfl <- corr_fun(dat = data_ms,outcomes = "NFL_CEL_residuals",high_markers = markers)
+)
+names(corr_nfl)[-1] <- c("NFL_CEL_residuals Spearma Rho","NFL_CEL_residuals Spearman pval (FDR-adj)")
+
+results <- left_join(results,corr_nfl)
+
+
+# rsqr
+outcome <- "NFL_CEL_residuals"
+dat <- data_ms
+
+wilc_p <- function(col_num){
+  # col_num <- 1
+mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+   final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcome,"_intercept"),
+                    paste0(outcome,"_intercept_pval"),
+                    paste0(outcome,"_coef"),
+                    paste0(outcome,"_coef_pval"),
+                    paste0(outcome,"_SEX_coef"),
+                    paste0(outcome,"_SEX_coef_pval"),
+                    paste0(outcome,"_SEX_interaction_coef"),
+                    paste0(outcome,"_SEX_intercation_pval"),
+                    paste0(outcome,"_Rsqr"),
+                    paste0(outcome,"_pval_FDR"))
+    
+
+    
+results <- left_join(results,final)
+
+
+
+#########################################
+# statistics for disability outcomes - CEL ONLY!!!!!!
+
+outcomes <- c("cel")
+
+for(i in 1:length(outcomes)){
+  # i <- 1
+  #MS
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms,outcomes = outcomes[i],high_markers = markers)
+)
+  
+names(corr_ms) <- c("marker",paste0("MS_",outcomes[i],"_Rho"),paste0("MS_",outcomes[i],"_Rho_pval_FDR"))
+
+results <- left_join(results,corr_ms)
+
+#MS - Females
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms_f,outcomes = outcomes[i],high_markers = markers)
+)
+
+names(corr_ms) <- c("marker",paste0("MS_F_",outcomes[i],"_Rho"),paste0("MS_F_",outcomes[i],"_Rho_pval_FDR"))
+
+
+results <- left_join(results,corr_ms)
+
+#MS - Males
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms_m,outcomes = outcomes[i],high_markers = markers)
+)
+
+names(corr_ms) <- c("marker",paste0("MS_M_",outcomes[i],"_Rho"),paste0("MS_M_",outcomes[i],"_Rho_pval_FDR"))
+
+results <- left_join(results,corr_ms)
+
+# rsqr
+outcome <- outcomes[i]
+dat <- data_ms
+
+wilc_p <- function(col_num){
+  # col_num <- 1
+mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcomes[i],"_intercept"),
+                    paste0(outcomes[i],"_intercept_pval"),
+                    paste0(outcomes[i],"_coef"),
+                    paste0(outcomes[i],"_coef_pval"),
+                    paste0(outcomes[i],"_SEX_coef"),
+                    paste0(outcomes[i],"_SEX_coef_pval"),
+                    paste0(outcomes[i],"_SEX_interaction_coef"),
+                    paste0(outcomes[i],"_SEX_intercation_pval"),
+                    paste0(outcomes[i],"_Rsqr"),
+                    paste0(outcomes[i],"_pval_FDR"))
+
+    
+results <- left_join(results,final)
+
+
+
+  
+}
+
+#########################################
+# statistics for disability outcomes - ALL OTHER OUTCOMES!!!!!
+
+outcomes <- c("t2ll","combiwise","brain_damage","sc_disability","GMSdis")
+outcomes_slopes <- c("t2ll","combi","bd","sc","gmsdis")
+slope_outcomes <- c("T2LL","CombiWISE","Brain_damage","SC_disability","GMSdis")
+
+for(i in 1:length(outcomes)){
+  # i <- 1
+  #MS
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms,outcomes = outcomes[i],high_markers = markers)
+)
+  
+names(corr_ms) <- c("marker",paste0("MS_",outcomes[i],"_Rho"),paste0("MS_",outcomes[i],"_Rho_pval_FDR"))
+
+results <- left_join(results,corr_ms)
+
+#MS - Females
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms_f,outcomes = outcomes[i],high_markers = markers)
+)
+
+names(corr_ms) <- c("marker",paste0("MS_F_",outcomes[i],"_Rho"),paste0("MS_F_",outcomes[i],"_Rho_pval_FDR"))
+
+
+results <- left_join(results,corr_ms)
+
+#MS - Males
+suppressWarnings(
+corr_ms <- corr_fun(dat = data_ms_m,outcomes = outcomes[i],high_markers = markers)
+)
+
+names(corr_ms) <- c("marker",paste0("MS_M_",outcomes[i],"_Rho"),paste0("MS_M_",outcomes[i],"_Rho_pval_FDR"))
+
+results <- left_join(results,corr_ms)
+
+##########
+# load slopes data - association of significant proteins in first and third tertile from script 300.2 - analysis ONE - somamer at first LP
+
+slop1 <- read_csv("./input/Analysis_one_Outcome_slopes_vs_Somamers_atFirstLP_in_tertials.csv")
+
+# isolate columns of interest
+to_join <- slop1 %>% 
+  dplyr::select(marker,
+                paste0(outcomes_slopes[i],"_slope_t3_t1_median_diff"),
+                paste0(outcomes_slopes[i],"_slope_t3_t1_diff_Wilcox_raw"),
+                paste0(outcomes_slopes[i],"_slope_t3_t1_diff_Wilcox_FDR"))
+
+
+results <- left_join(results,to_join)
+
+
+##########
+# load slopes data - association of change in significant proteins in first and third tertile from script 300.2 - analysis TWO - change in somamers
+
+slop2 <- read_csv("./input/Analysis_TWO_Outcome_slopes_vs_SomamerSLopes_in_tertials.csv")
+
+# isolate columns of interest
+to_join <- slop2 %>% 
+  dplyr::select(marker,
+                paste0(outcomes_slopes[i],"_slope_change_t3_t1_median_diff"),
+                paste0(outcomes_slopes[i],"_slope_change_t3_t1_diff_Wilcox_raw"),
+                paste0(outcomes_slopes[i],"_slope_change_t3_t1_diff_Wilcox_FDR"))
+
+
+results <- left_join(results,to_join)
+
+
+# rsqr
+outcome <- outcomes[i]
+dat <- data_ms
+
+wilc_p <- function(col_num){
+  # col_num <- 1
+mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcomes[i],"_intercept"),
+                    paste0(outcomes[i],"_intercept_pval"),
+                    paste0(outcomes[i],"_coef"),
+                    paste0(outcomes[i],"_coef_pval"),
+                    paste0(outcomes[i],"_SEX_coef"),
+                    paste0(outcomes[i],"_SEX_coef_pval"),
+                    paste0(outcomes[i],"_SEX_interaction_coef"),
+                    paste0(outcomes[i],"_SEX_intercation_pval"),
+                    paste0(outcomes[i],"_Rsqr"),
+                    paste0(outcomes[i],"_pval_FDR"))
+
+    
+results <- left_join(results,final)
+
+
+
+  
+}
+
+##################################################
+# group differences
+
+# MS vs HD
+
+differences <- tibble::enframe(markers,name = NULL,value = "marker")
+differences$MS_HD_median_diff <- NA
+
+for(l in 1:length(markers)){
+      # l <- 1
+      differences$MS_HD_median_diff[l] <- median(data_ms[[markers[l]]]) - median(data_hd[[markers[l]]])
+      
+    }
+  
+var <- "cohort"
+dat <- data_all
+wilc_p <- function(col_num){
+      # col_num <- 1
+      wilc <- wilcox.test(dat[[markers[col_num]]]~dat[[var]], alternative = "two.sided")
+      
+      p <- tibble::enframe(wilc$p.value,name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V1 <- p.adjust(final$V1,method = "fdr")
+    
+    
+    names(final)[2] <- "MS_vs_HD_diff_Wilcox_FDR"
+    names(final)[1] <- "marker"
+    
+
+results <- left_join(results,differences)
+results <- left_join(results,final)
+
+##################################################
+# group differences
+
+# MS F vs MS M
+
+
+
+differences <- tibble::enframe(markers,name = NULL,value = "marker")
+differences$MS_F_M_median_diff <- NA
+
+for(l in 1:length(markers)){
+      # l <- 1
+      differences$MS_F_M_median_diff[l] <- median(data_ms_f[[markers[l]]]) - median(data_ms_m[[markers[l]]])
+      
+    }
+  
+var <- "gender"
+dat <- data_ms
+wilc_p <- function(col_num){
+      # col_num <- 1
+      wilc <- wilcox.test(dat[[markers[col_num]]]~dat[[var]], alternative = "two.sided")
+      
+      p <- tibble::enframe(wilc$p.value,name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V1 <- p.adjust(final$V1,method = "fdr")
+    
+    
+    names(final)[2] <- "MS_F_vs_MS_M_diff_Wilcox_FDR"
+    names(final)[1] <- "marker"
+    
+
+results <- left_join(results,differences)
+results <- left_join(results,final)
+
+#########################################
+#
+# longitudinal cohort
+#
+#########################################
+
+# isolate longitudinal cohort
+
+long_data <- data_ms
+
+# get number of visits per patient 
+nr_visits <- tibble::enframe(table(long_data$patientcode),name = "patientcode",value = "nr_visits")
+
+long_data <- right_join(nr_visits,long_data)
+
+long_data <- long_data %>% 
+  filter(nr_visits>1)
+
+table(long_data$nr_visits)
+
+# generate length of fu
+
+data_first <- long_data %>% 
+  group_by(patientcode) %>% 
+  arrange(age) %>% 
+  slice_head() %>% 
+  ungroup() %>% 
+  arrange(patientcode)
+
+data_last <- long_data %>% 
+  group_by(patientcode) %>% 
+  arrange(age) %>% 
+  slice_tail() %>% 
+  ungroup() %>% 
+  arrange(patientcode)
+
+length(data_first$patientcode==data_last$patientcode)
+
+data_first$fu_length <- data_last$age - data_first$age
+
+fu_length <- data_first %>% 
+  dplyr::select(patientcode,fu_length)
+
+long_data <- right_join(fu_length,long_data)
+
+
+# remove follow-up less than 1.5 year
+
+long_data <- long_data %>% 
+  filter(fu_length>1.5)
+
+median(long_data$fu_length)
+min(long_data$fu_length)
+max(long_data$fu_length)
+
+################################################
+# calculate somamer and pathway yearly slopes 
+################################################
+
+##################!!!!!!!!!!!!!!!!!!!!!!##################################
+#
+#.  THIS STEP TAKES TIME -> RUN ONCE AND THEN JUST UPLOAD RESULTS
+#
+##################!!!!!!!!!!!!!!!!!!!!!!!#################################
+
+# 
+# # Get patient-specific slopes
+# patient_coeffs <- get_patient_specific_coefficients(long_data, subject_col = "patientcode", age_col = "age", variables = markers)
+# 
+# # View the results
+# head(patient_coeffs)
+# 
+# patient_coeffs_clean <- patient_coeffs %>%
+#   separate(Subject_ID, into = c("patientcode","markers"),sep="\\.")
+# 
+# # rename outcome
+# names(patient_coeffs_clean)[3] <- "slope"
+# 
+# patient_coeffs_clean_wide <- patient_coeffs_clean %>%
+#   pivot_wider(names_from = markers, values_from = slope)
+# 
+# write_csv(patient_coeffs_clean_wide,"./output/longitudinal_analyses/patient_specific_slopes_somamers_10102024.csv")
+
+patient_coeffs_clean_wide <- read_csv("./input/patient_specific_slopes_somamers.csv")
+
+##############!!!!!!!!!!!!!!!!!!!!##############################################
+#
+#         GENERATE medians and p-values for somamers and pathways 
+#         for longitudinal patient-specific slopes
+#
+##############!!!!!!!!!!!!!!!!!!!!##############################################
+
+medians_pvals <- tibble::enframe(names(patient_coeffs_clean_wide)[-1],name = NULL,value = "marker")
+
+medians_pvals$patient_slope_median <- apply(X = patient_coeffs_clean_wide[-1],MARGIN = 2,FUN = median)
+
+dat <- patient_coeffs_clean_wide
+wilc_p <- function(col_num){
+  # col_num <- 1
+  wilc <- wilcox.test(dat[[markers[col_num]]],mu=0,alternative = "two.sided")
+  
+  p <- tibble::enframe(wilc$p.value,name = NULL, value = markers[col_num])
+  out <- (p)
+  
+  return(out)
+}
+
+
+seq <- c(1:length(markers))
+
+fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+
+final <- as.data.frame(t(fin))
+final$marker <- markers
+final <- final %>% 
+  select(marker,everything())
+final$fdr <- p.adjust(final$V1,method = "fdr")
+
+names(final)[3] <- "patient_slopes_oneSampleWilcox_FDR"
+names(final)[2] <- "patient_slopes_oneSampleWilcox_raw_pval"
+names(final)[1] <- "marker"
+
+
+patient_specific_slopes <- left_join(medians_pvals, final)
+
+# patient_specific_slopes <- read_csv("./output/longitudinal_analyses/patiet_specific_slopes_medians_pval_09042024.csv")
+
+results <- left_join(results,patient_specific_slopes)
+
+
+
+
+
+######################################
+# propensity matched samples
+
+var <- c("bd_t2","t2_bd","bd_combi","combi_bd")
+
+for(i in 1:length(var)){
+# i <- 1
+
+data_q1 <- data_ms %>% 
+  filter(data_ms[[var[i]]]=="q1") 
+data_q1 <- data_q1 %>% 
+  arrange(data_q1[[paste0(var[i],"_subclass")]])
+
+data_q3 <- data_ms %>% 
+  filter(data_ms[[var[i]]]=="q3")
+data_q3 <- data_q3 %>% 
+  arrange(data_q3[[paste0(var[i],"_subclass")]])
+
+difference <- data_q1[,c(1:2)]
+
+for(l in 1:length(markers)){
+      # l <- 1
+      difference[[markers[l]]] <- data_q3[[markers[l]]] - data_q1[[markers[l]]]
+      
+}
+
+# calculate median of paired differences
+
+differences <- tibble::enframe(markers,name = NULL,value = "marker")
+differences[[paste0(var[i],"_median_diff")]] <- apply(X = difference[,..markers],MARGIN = 2,FUN = median)
+  
+
+dat <- rbind(data_q1,data_q3)
+wilc_p <- function(col_num){
+      # col_num <- 1
+      wilc <- wilcox.test(dat[[markers[col_num]]]~dat[[var[i]]], alternative = "two.sided", paired=TRUE)
+      
+      p <- tibble::enframe(wilc$p.value,name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V1 <- p.adjust(final$V1,method = "fdr")
+    
+    
+    names(final)[2] <- paste0(var[i],"_median_diff_Wilcox_paired_FDR")
+    names(final)[1] <- "marker"
+    
+
+results <- left_join(results,differences)
+results <- left_join(results,final)
+
+}
+
+##############################
+# HLA-DR differences
+
+# HLA-DR considered a continuous variable 
+
+# rsqr
+outcome <- "drb1_15"
+dat <- to_plot_age_residuals
+
+class(dat$drb1_15)
+
+wilc_p <- function(col_num){
+      # col_num <- 2
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcome,"_intercept"),
+                    paste0(outcome,"_intercept_pval"),
+                    paste0(outcome,"_coef"),
+                    paste0(outcome,"_coef_pval"),
+                    paste0(outcome,"_SEX_coef"),
+                    paste0(outcome,"_SEX_coef_pval"),
+                    paste0(outcome,"_SEX_interaction_coef"),
+                    paste0(outcome,"_SEX_intercation_pval"),
+                    paste0(outcome,"_Rsqr"),
+                    paste0(outcome,"_pval_FDR"))
+  
+results <- left_join(results,final)
+
+##############################
+# HLA-DR differences INCLUDING 15:01+15:03
+
+# HLA-DR considered a continuous variable 
+
+# rsqr
+outcome <- "drb1_15_0103"
+dat <- to_plot_age_residuals
+
+class(dat$drb1_15)
+
+wilc_p <- function(col_num){
+      # col_num <- 2
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcome,"_intercept"),
+                    paste0(outcome,"_intercept_pval"),
+                    paste0(outcome,"_coef"),
+                    paste0(outcome,"_coef_pval"),
+                    paste0(outcome,"_SEX_coef"),
+                    paste0(outcome,"_SEX_coef_pval"),
+                    paste0(outcome,"_SEX_interaction_coef"),
+                    paste0(outcome,"_SEX_intercation_pval"),
+                    paste0(outcome,"_Rsqr"),
+                    paste0(outcome,"_pval_FDR"))
+  
+results <- left_join(results,final)
+
+
+##############################
+# BMI differences - continuous
+
+
+# rsqr
+outcome <- "bmi"
+dat <- to_plot_age_residuals
+wilc_p <- function(col_num){
+      # col_num <- 1
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcome,"_intercept"),
+                    paste0(outcome,"_intercept_pval"),
+                    paste0(outcome,"_coef"),
+                    paste0(outcome,"_coef_pval"),
+                    paste0(outcome,"_SEX_coef"),
+                    paste0(outcome,"_SEX_coef_pval"),
+                    paste0(outcome,"_SEX_interaction_coef"),
+                    paste0(outcome,"_SEX_intercation_pval"),
+                    paste0(outcome,"_Rsqr"),
+                    paste0(outcome,"_pval_FDR"))
+    
+results <- left_join(results,final)
+
+##############################
+# BMI differences - categorical 
+
+
+# rsqr
+outcome <- "bmi_cat2"
+dat <- to_plot_age_residuals
+wilc_p <- function(col_num){
+      # col_num <- 1
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcome,"_intercept"),
+                    paste0(outcome,"_intercept_pval"),
+                    paste0(outcome,"_coef"),
+                    paste0(outcome,"_coef_pval"),
+                    paste0(outcome,"_SEX_coef"),
+                    paste0(outcome,"_SEX_coef_pval"),
+                    paste0(outcome,"_SEX_interaction_coef"),
+                    paste0(outcome,"_SEX_intercation_pval"),
+                    paste0(outcome,"_Rsqr"),
+                    paste0(outcome,"_pval_FDR"))
+    
+results <- left_join(results,final)
+
+
+##############################
+# smoking differences
+
+
+# rsqr
+outcome <- "smoking"
+dat <- to_plot_age_residuals
+wilc_p <- function(col_num){
+      # col_num <- 1
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+    final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcome,"_intercept"),
+                    paste0(outcome,"_intercept_pval"),
+                    paste0(outcome,"_coef"),
+                    paste0(outcome,"_coef_pval"),
+                    paste0(outcome,"_SEX_coef"),
+                    paste0(outcome,"_SEX_coef_pval"),
+                    paste0(outcome,"_SEX_interaction_coef"),
+                    paste0(outcome,"_SEX_intercation_pval"),
+                    paste0(outcome,"_Rsqr"),
+                    paste0(outcome,"_pval_FDR"))
+  
+results <- left_join(results,final)
+
+
+##############################
+# race differences
+
+
+# rsqr
+outcome <- "ethnicity"
+dat <- to_plot_age_residuals %>% 
+  filter(!is.na(ethnicity)) %>% 
+  mutate_at(.vars = "ethnicity",.funs = function(x){factor(x,levels = c("AA","W"))})
+
+wilc_p <- function(col_num){
+      # col_num <- 1
+      mod <- summary(lm(dat[[markers[col_num]]]~dat[[outcome]]*dat$gender))
+      f <- mod$fstatistic
+      pval <- as.numeric(pf(f[1],f[2],f[3],lower.tail=F))
+      
+      p <- tibble::enframe(c(mod$coefficients[1,1],
+                           mod$coefficients[1,4],
+                           mod$coefficients[2,1],
+                           mod$coefficients[2,4],
+                           mod$coefficients[3,1],
+                           mod$coefficients[3,4],
+                           mod$coefficients[4,1],
+                           mod$coefficients[4,4],
+                           mod$r.squared,
+                           pval),
+                         name = NULL, value = markers[col_num])
+      out <- (p)
+      
+      return(out)
+    }
+    
+    
+    seq <- c(1:length(markers))
+    
+    fin <- bind_cols(lapply(1:length(seq), function(x) wilc_p(seq[x])))
+    
+    final <- as.data.frame(t(fin))
+    final$marker <- markers
+    final <- final %>% 
+      select(marker,everything())
+     final$V10 <- p.adjust(final$V10,method = "fdr")
+  names(final) <- c("marker",
+                    paste0(outcome,"_intercept"),
+                    paste0(outcome,"_intercept_pval"),
+                    paste0(outcome,"_coef"),
+                    paste0(outcome,"_coef_pval"),
+                    paste0(outcome,"_SEX_coef"),
+                    paste0(outcome,"_SEX_coef_pval"),
+                    paste0(outcome,"_SEX_interaction_coef"),
+                    paste0(outcome,"_SEX_intercation_pval"),
+                    paste0(outcome,"_Rsqr"),
+                    paste0(outcome,"_pval_FDR"))
+    
+results <- left_join(results,final)
+```
+
+```{r}
+# filter out non-human marker
+
+org <- read_csv("./input/organism.csv")
+
+org <- org %>% 
+  filter(organism=="Human")
+
+results_clean <- results %>% 
+  filter(marker %in% org$marker)
+
+openxlsx::write.xlsx(results_clean,"./output/masterspreadsheet/somamers_5k_masterspreadsheet.xlsx",asTable = TRUE)
+
+# save as csv 
+write_csv(results_clean,"./output/masterspreadsheet/somamers_5k_masterspreadsheet.csv")
+
+```

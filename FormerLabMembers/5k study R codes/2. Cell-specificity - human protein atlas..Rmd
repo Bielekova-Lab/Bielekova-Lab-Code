@@ -1,0 +1,453 @@
+---
+title: "cell-specificity from Human protein atlas"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  html_notebook: default
+---
+
+THIS SCRIPT analyzes cell-specificty based on human protein atlas data 
+
+###################
+
+Set the environment 
+
+```{r}
+
+remove(list = ls())
+
+library(readr, quietly = TRUE)
+library(readxl, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(tidyr, quietly = TRUE)
+library(lubridate, quietly = TRUE)
+library(purrr, quietly = TRUE)
+library(bindrcpp, quietly = TRUE)
+library(data.table, quietly = TRUE)
+library(stringr, quietly = TRUE)
+library(ggplot2, quietly = TRUE)
+library(tidyr, quietly = TRUE)
+library(corrr, quietly = TRUE)
+library(Hmisc, quietly = TRUE)
+library(foreach, quietly = TRUE)
+library(diptest, quietly = TRUE)
+library(glmnet)
+library(broom)
+library(plyr)
+library(epiR)
+library(Metrics)
+library(ggpubr)
+library(gridExtra)
+
+```
+
+
+
+load functions
+
+```{r}
+'%notin%' <- function(x,y)!('%in%'(x,y))
+
+
+tsapply <- function(...){t(sapply(...))}
+
+cor_est <- function(x,y,...){
+  obj <- cor.test(x,y,...)
+  val <- obj$estimate
+  return(round(as.numeric(val),digits = 3))
+}
+cor_pval <- function(x,y,...){
+  obj <- cor.test(x,y,...)
+  pval <- obj$p.value
+  return(as.numeric(pval))
+}
+
+
+corr_fun <- function(dat,outcomes,high_markers,...){
+    dat_est <- sapply(outcomes,function(ychar){
+    sapply(high_markers,function(xchar){
+      cor_est(dat[[xchar]],dat[[ychar]],method="spearman")
+    })
+  })
+  
+ 
+  dat_pval <- sapply(outcomes,function(ychar){sapply(high_markers,function(xchar){
+    cor_pval(dat[[xchar]],dat[[ychar]],method="spearman")})})
+  
+  
+  dat_pval <- as_tibble(dat_pval) %>% 
+    mutate_all(p.adjust,method="fdr") %>%
+    mutate(marker = high_markers,type="p-value") %>%  
+    dplyr::select(marker,type,everything()) 
+  
+  dat_est <- as_tibble(dat_est) %>% 
+    mutate(marker = high_markers,type="spearman") %>% 
+    dplyr::select(marker,type,everything())
+  
+  dat_results <- bind_rows(dat_est,dat_pval) # stack em up
+  dat_results <- dat_results %>% 
+    gather(key,value,outcomes) 
+ 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    mutate(type=factor(type,levels=c("spearman","p-value"))) %>% 
+    arrange(marker,key,type) %>%    
+    mutate(key = paste(as.character(key),type)) %>% 
+    dplyr::select(-type) 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    spread(key,value) 
+  
+  
+  
+  return(dat_results)
+}
+
+
+
+```
+
+Load data
+
+```{r}
+
+
+############
+# 1. load rna tissue consensus file
+
+rna_cons <- read_tsv("./input/rna_tissue_consensus.tsv")
+
+rna_cons_wide <- rna_cons %>% 
+  spread(key=Tissue,value=nTPM)
+
+vars <- names(rna_cons_wide)[-c(1:2)]
+dput(vars)
+
+# selection of variables of interest
+vars_interest <- c("amygdala","basal ganglia","bone marrow","cerebellum",
+                   "cerebral cortex","choroid plexus",
+                   "hippocampal formation", "hypothalamus",
+                   "lymph node","pituitary gland","midbrain",
+                   "smooth muscle","spinal cord","spleen","thymus")
+
+rna_cons_wide_final <- rna_cons_wide %>% 
+  dplyr::select("Gene","Gene name",all_of(vars_interest))
+
+write_csv(rna_cons_wide_final,"./output/cell_specificity/rna_cons_wide_final.csv")
+
+############
+# 2. load brain tissue consensus file
+
+rna_brain_gtex <- read_tsv("./input/rna_brain_gtex.tsv")
+
+
+rna_brain_gtex_wide <- rna_brain_gtex %>% 
+  dplyr::select(-c("TPM","pTPM")) %>% 
+  dplyr::rename(Brain_region=`Brain region`)%>% 
+  spread(key=Brain_region,value=nTPM) 
+
+
+vars2 <- names(rna_brain_gtex_wide)[-c(1:2)]
+dput(vars2)
+
+# selection of variables of interest
+vars_interest2 <- c("amygdala", "basal ganglia", "cerebellum", "cerebral cortex", 
+"hippocampal formation", "hypothalamus", "midbrain", "pituitary gland", 
+"retina", "spinal cord")
+
+
+rna_brain_gtex_wide_final <- rna_brain_gtex_wide %>% 
+  dplyr::select("Gene","Gene name",all_of(vars_interest2))
+
+write_csv(rna_brain_gtex_wide_final,"./output/cell_specificity/rna_brain_gtex_wide_final.csv")
+
+############
+# 3. Add single cell consensus file
+
+rna_single_cell <- read_tsv("./input/rna_single_cell_type.tsv")
+
+rna_single_cell_wide <- rna_single_cell %>% 
+  spread(key=`Cell type`,value=nTPM) %>% 
+  dplyr::rename(OPC = `Oligodendrocyte precursor cells`)
+
+vars3 <- names(rna_single_cell_wide)[-c(1:2)]
+
+dput(vars3)
+
+
+# selection of variables of interest
+vars_interest3 <- c("Astrocytes", "B-cells","dendritic cells","Endothelial cells",
+  "Excitatory neurons","Fibroblasts","granulocytes","Inhibitory neurons",
+  "Lymphatic endothelial cells", "Macrophages","Microglial cells","monocytes",
+  "NK-cells", "OPC","Oligodendrocytes","Plasma cells","Schwann cells","T-cells")
+
+rna_single_cell_wide_final <- rna_single_cell_wide %>% 
+  dplyr::select("Gene","Gene name",all_of(vars_interest3))
+
+write_csv(rna_single_cell_wide_final,"./output/cell_specificity/rna_single_cell_wide_final.csv")
+
+############
+# 4. Add immune cell consensus file
+
+rna_immune <- read_tsv("./input/rna_immune_cell.tsv")
+
+rna_immune_wide <- rna_immune %>% 
+  dplyr::select(-c("TPM","pTPM")) %>% 
+  spread(key=`Immune cell`,value=nTPM)
+
+vars4 <- names(rna_immune_wide)[-c(1:2)]
+dput(vars4)
+
+# selection of variables of interest
+vars_interest4 <- dput(vars4)
+
+rna_immune_wide_final <- rna_immune_wide %>% 
+  dplyr::select("Gene","Gene name",all_of(vars_interest4))
+
+write_csv(rna_immune_wide_final,"./output/cell_specificity/rna_immune_wide_final.csv")
+
+
+```
+
+```{r}
+###########################################################
+#
+#. RNA tissue analysis
+#
+###########################################################
+
+# 1. identify max and second max
+# 2. calculate median 
+# 3. calcluate mx/median 
+
+data <- rna_cons_wide_final
+varss <- vars_interest
+
+# add 0.0001 to 0 
+data[data==0] <- 0.0001
+
+results <- as.data.frame(matrix(NA,nrow =length(data$Gene), ncol = 7),)
+names(results) <- c("Gene","max_name","max_value","sec_max_name","sec_max_name","med","max_med")
+
+for(row_num in 1:length(data$Gene)){
+# row_num <- 2565
+  y <- data[row_num,which(data[row_num,varss] == max(data[row_num,varss],na.rm = TRUE))+2]
+
+# name
+z <- names(y)[1]
+#value
+zz <- as.numeric(y)[1]
+
+# second max
+second_varss <- varss[-which(varss == z)]
+second_max <- data[row_num,second_varss]
+yy <- second_max[1,which(second_max[1,second_varss] == max(second_max[1,second_varss],na.rm = TRUE))]
+
+#second name
+w <- names(yy)[1]
+# value
+ww <- as.numeric(yy)[1]
+
+# median
+
+med_exp <- median(as.numeric(data[row_num,varss]))
+
+# max/median
+
+max_med <- round(zz/med_exp,2)
+
+results[row_num,] <- c(data$Gene[row_num],z,zz,w,ww,med_exp,max_med)
+
+print(row_num)
+}
+
+rna_cons_wide_summary <- results
+
+write_csv(rna_cons_wide_summary,"./output/cell_specificity/rna_cons_wide_summary.csv")
+
+
+```
+
+```{r}
+
+###########################################################
+#
+#. RNA brain analysis
+#
+###########################################################
+
+# 1. identify max and second max
+# 2. calculate median 
+# 3. calcluate mx/median 
+
+data <- rna_brain_gtex_wide_final
+varss <- vars_interest2
+
+# add 0.0001 to 0 
+data[data==0] <- 0.0001
+
+results <- as.data.frame(matrix(NA,nrow =length(data$Gene), ncol = 7),)
+names(results) <- c("Gene","max_name","max_value","sec_max_name","sec_max_name","med","max_med")
+
+for(row_num in 1:length(data$Gene)){
+# row_num <- 20162
+  y <- data[row_num,which(data[row_num,varss] == max(data[row_num,varss],na.rm = TRUE))+2]
+
+# name
+z <- names(y)[1]
+#value
+zz <- as.numeric(y)[1]
+
+# second max
+second_varss <- varss[-which(varss == z)]
+second_max <- data[row_num,second_varss]
+yy <- second_max[1,which(second_max[1,second_varss] == max(second_max[1,second_varss],na.rm = TRUE))]
+
+#second name
+w <- names(yy)[1]
+# value
+ww <- as.numeric(yy)[1]
+
+# median
+
+med_exp <- median(as.numeric(data[row_num,varss]))
+
+# max/median
+
+max_med <- round(zz/med_exp,2)
+
+results[row_num,] <- c(data$Gene[row_num],z,zz,w,ww,med_exp,max_med)
+
+print(row_num)
+}
+
+rna_brain_gtex_wide_summary <- results
+
+write_csv(rna_brain_gtex_wide_summary,"./output/cell_specificity/rna_brain_gtex_wide_summary.csv")
+
+```
+
+
+```{r}
+
+###########################################################
+#
+#. RNA single cell analysis
+#
+###########################################################
+
+# 1. identify max and second max
+# 2. calculate median 
+# 3. calcluate mx/median 
+
+data <- rna_single_cell_wide_final
+varss <- vars_interest3
+
+# add 0.0001 to 0 
+data[data==0] <- 0.0001
+
+results <- as.data.frame(matrix(NA,nrow =length(data$Gene), ncol = 7),)
+names(results) <- c("Gene","max_name","max_value","sec_max_name","sec_max_name","med","max_med")
+
+for(row_num in 1:length(data$Gene)){
+# row_num <- 20162
+  y <- data[row_num,which(data[row_num,varss] == max(data[row_num,varss],na.rm = TRUE))+2]
+
+# name
+z <- names(y)[1]
+#value
+zz <- as.numeric(y)[1]
+
+# second max
+second_varss <- varss[-which(varss == z)]
+second_max <- data[row_num,second_varss]
+yy <- second_max[1,which(second_max[1,second_varss] == max(second_max[1,second_varss],na.rm = TRUE))]
+
+#second name
+w <- names(yy)[1]
+# value
+ww <- as.numeric(yy)[1]
+
+# median
+
+med_exp <- median(as.numeric(data[row_num,varss]))
+
+# max/median
+
+max_med <- round(zz/med_exp,2)
+
+results[row_num,] <- c(data$Gene[row_num],z,zz,w,ww,med_exp,max_med)
+
+print(row_num)
+}
+
+rna_single_cell_wide_summary <- results
+
+write_csv(rna_single_cell_wide_summary,"./output/cell_specificity/rna_single_cell_wide_summary.csv")
+
+```
+
+```{r}
+
+###########################################################
+#
+#. RNA immune cell analysis
+#
+###########################################################
+
+# 1. identify max and second max
+# 2. calculate median 
+# 3. calcluate mx/median 
+
+data <- rna_immune_wide_final
+
+# exclude total PBMC from the analysis
+varss <- vars_interest4[-length(vars_interest4)]
+
+# add 0.0001 to 0 
+data[data==0] <- 0.0001
+
+results <- as.data.frame(matrix(NA,nrow =length(data$Gene), ncol = 7),)
+names(results) <- c("Gene","max_name","max_value","sec_max_name","sec_max_name","med","max_med")
+
+for(row_num in 1:length(data$Gene)){
+# row_num <- 20162
+  y <- data[row_num,which(data[row_num,varss] == max(data[row_num,varss],na.rm = TRUE))+2]
+
+# name
+z <- names(y)[1]
+#value
+zz <- as.numeric(y)[1]
+
+# second max
+second_varss <- varss[-which(varss == z)]
+second_max <- data[row_num,second_varss]
+yy <- second_max[1,which(second_max[1,second_varss] == max(second_max[1,second_varss],na.rm = TRUE))]
+
+#second name
+w <- names(yy)[1]
+# value
+ww <- as.numeric(yy)[1]
+
+# median
+
+med_exp <- median(as.numeric(data[row_num,varss]))
+
+# max/median
+
+max_med <- round(zz/med_exp,2)
+
+results[row_num,] <- c(data$Gene[row_num],z,zz,w,ww,med_exp,max_med)
+
+print(row_num)
+}
+
+rna_immune_wide_summary <- results
+
+write_csv(rna_immune_wide_summary,"./output/cell_specificity/rna_immune_wide_summary.csv")
+
+```
+

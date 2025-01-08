@@ -1,0 +1,767 @@
+---
+title: "HD Age/Sex adjustemnt of 5k"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  html_notebook: default
+---
+
+THIS SCRIPT performs adjustment for HD age/sex for high signalling somamers in 5kdataset
+
+- All MS and HD samples were used to calculate SNR
+- high signaling somamers are then adjusted for HD age and sex
+- adjusted somamers for untreated MS samples are then correlated with disability outcomes
+- correlation coefficients are submitted to IPA for Core analysis 
+
+###################
+
+Set the environment 
+
+```{r}
+
+remove(list = ls())
+
+
+library(readr, quietly = TRUE)
+library(readxl, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(data.table, quietly = TRUE)
+library(foreach, quietly = TRUE)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(lme4)
+library(ggpubr)
+library(openxlsx)
+library(glmnet)
+library(tidyr)
+library(broom)
+library(REdaS)
+library(vioplot)
+library(epiR)
+
+```
+
+
+
+
+load functions
+
+```{r}
+'%notin%' <- function(x,y)!('%in%'(x,y))
+
+
+tsapply <- function(...){t(sapply(...))}
+
+
+remove_outlier <-
+  function(x, mult, ...) {
+      upper <-
+      quantile(x, 3 / 4, na.rm = TRUE) + mult * IQR(x, na.rm = TRUE)   
+    downer <-
+      quantile(x, 1 / 4, na.rm = TRUE) - mult * IQR(x, na.rm = TRUE)   
+       out <- ifelse(x > upper | x < downer, NA, x)
+    return(out)
+  }
+
+remout_fun <- function(dat, outcomes, mult, ...) {
+    dat_noout <- dat %>%
+       mutate_at(outcomes, remove_outlier, mult = mult)
+  return(dat_noout)
+}
+
+
+curb_outlier <-
+  function(x, mult = 3, ...) {
+    upper <-
+      quantile(x, 3 / 4, na.rm = TRUE) + mult * IQR(x, na.rm = TRUE)   
+    downer <-
+      quantile(x, 1 / 4, na.rm = TRUE) - mult * IQR(x, na.rm = TRUE)   
+   
+     out <- ifelse(x > upper, upper, ifelse(x < downer, downer, x))
+    
+   return(out)
+  }
+
+
+
+remove_singleton <- function(data){
+  if(is.null(groups(data))==TRUE){
+    stop("Need to pass a dataset with a grouping structure")
+  }
+  if(is.null(groups(data))==FALSE){
+    newdata <- data %>%
+      nest %>%
+      mutate(nrows = sapply(data,function(dat){dim(dat)[1]})) %>%
+      filter(nrows > 1 ) %>%
+      dplyr::select(-nrows) %>% 
+      unnest
+    return(newdata)
+  }
+}
+
+
+
+```
+
+Load raw data
+
+```{r}
+demo_5k <- read_csv("./input/outcomes_5k.csv")
+soma_5k <- fread("./input/soma_raw_5k.csv")
+transl_5k <- read_excel("./input/translation file 5k new.xlsx")
+
+markers_5k <- transl_5k$SomaID
+seqid_5k <- transl_5k$seqid
+
+```
+convert somaID to seqID
+```{r}
+soma_5k <- soma_5k %>% 
+  dplyr::select(sampleid,all_of(markers_5k))
+
+names(soma_5k)[-1] <- seqid_5k
+```
+
+merge demo and soma
+```{r}
+data_5k <- merge(demo_5k,soma_5k,by="sampleid")
+```
+
+#########################################################
+             log-transform data
+#########################################################
+
+```{r}
+data_5k_log <- data_5k %>% 
+  dplyr::mutate_at(seqid_5k,.funs = log)
+```
+
+#########################################################
+ generate HD cohort and identify outlier samples
+ (samples that have > 15% of somamers as outliers)
+#########################################################
+
+5K
+
+```{r}
+data_5k_hd <- data_5k_log %>% 
+  filter(diagnosis=="HD")
+
+```
+
+remove outliers in the 5k HD cohort
+
+```{r}
+data_5k_hd_noout <- remout_fun(dat = data_5k_hd,outcomes = seqid_5k,mult = 1.5)
+
+a <- as.data.frame(apply(data_5k_hd_noout[,seqid_5k], MARGIN = 1,function(x) sum(is.na(x))))
+
+```
+
+remove samples with more than 15% of somamers as outliers
+
+```{r}
+data_5k_hd_noout <- data_5k_hd_noout[which(a$`apply(data_5k_hd_noout[, seqid_5k], MARGIN = 1, function(x) sum(is.na(x)))`<0.15*length(seqid_5k)),]
+
+```
+
+identify HD outliers in the HD cohort
+
+```{r}
+to_remove_5k <- data_5k_hd$sampleid[which(data_5k_hd$sampleid %notin% data_5k_hd_noout$sampleid)]
+
+hist(a$`apply(data_5k_hd_noout[, seqid_5k], MARGIN = 1, function(x) sum(is.na(x)))`,main = "# of soma as outliers per sample",xlab = "# outliers")
+
+```
+remove HD outliers from whole data
+
+```{r}
+data_5k_log <- data_5k_log[-which(data_5k_log$sampleid %in% to_remove_5k),]
+```
+
+
+###############################################################################
+
+ calculate SNR in selected somamers - using longitudinal HD samples 
+ w/o outliers as technical replicates 
+ and MS cohort samples to calculate biological variance 
+
+###############################################################################
+
+5k
+
+```{r}
+techrep_potential <- data_5k_hd_noout %>% 
+  group_by(patientcode) %>% 
+  remove_singleton() %>% 
+  ungroup() %>% 
+  arrange(patientcode) 
+
+training <- data_5k_log %>% 
+  filter(diagnosis %in% c("RR-MS","SP-MS","PP-MS"))
+```
+
+
+CALCULATE SNR
+
+```{r}
+marker_tibble <- tibble::enframe(seqid_5k,name = NULL,value = "seqid")
+
+marker_tibble$tech_sigma <- NA
+marker_tibble$clin_sigma <- NA
+
+
+for(i in 1:length(seqid_5k)){
+  # i <- 1
+  
+
+    
+  f <- as.formula(paste0("`",seqid_5k[i],"`","~ (1|patientcode)"))
+  
+  
+  tech_var <- lmer(formula = f,data = techrep_potential )
+  
+  marker_tibble$tech_sigma[i] <- summary(tech_var)$sigma
+  
+  fr <- as.formula(paste0("`",seqid_5k[i],"`"," ~ 1"))
+  
+  
+  clin_var <- lm(formula = fr,data = training )
+  
+  
+  marker_tibble$clin_sigma[i] <- summary(clin_var)$sigma
+  
+}
+
+
+# calculate SNR
+var_comps <- marker_tibble %>% 
+  mutate(snr=clin_sigma^2/(clin_sigma^2+tech_sigma^2)) 
+
+# sort SNR
+var_comps <- var_comps %>% 
+  arrange(desc(snr))
+
+# hist(var_comps$snr)
+
+var_comps_5k_all <- var_comps
+
+
+r <- var_comps_5k_all %>% 
+  ggplot(aes(x=snr)) +  
+  geom_histogram(fill="white",color="blue",bins = 50) +
+  xlab("SNR")+
+  # xlim(c(0,1))+
+  # ylim(c(0,260))+
+  geom_vline(xintercept = 0.8, color="red")+
+  ggtitle(paste0("5k SOMA SNR (80% cut-off: ", length(which(var_comps_5k_all$snr>0.8))," soma retained)")) +
+  theme_bw()+
+  theme(
+    # legend.background = element_rect(fill="transparent"),
+    axis.text.x = element_text(size=12,colour="#404040",hjust = 1, vjust = 1,angle = 45),
+    axis.text.y = element_text(size=12,hjust = 0.5,vjust = .5 ),
+    axis.title.y = element_text(color="#404040",size=14),
+    axis.title.x = element_text(color="#404040",size=14),
+    # legend.box.background = element_rect(colour = "black",fill="white"),
+    legend.position = "right",
+    axis.line = element_blank(),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+    # panel.grid.major.y = element_line(color="gray",size=.25),
+    panel.border = element_rect(colour = "black", fill=NA, size=0.5)
+  )
+r
+
+
+write_csv(var_comps_5k_all,"./output/age_sex_adj/5k_SNR.csv")
+```
+
+Isolate somamers that passed 0.8 SNR cutoff
+
+
+```{r}
+var_selection <- var_comps_5k_all %>% 
+  filter(snr>=0.8)
+
+#merge with translation file 
+
+var_selection <- left_join(var_selection,transl_5k)
+
+print(paste0("Number of high-SNR somamers: ", length(var_selection$seqid)))
+
+high_markers <- var_selection$seqid
+high_markers_soma <- var_selection$SomaID
+```
+
+#############################################################################################
+
+ isolation of somamers significantly correlated with age and gender in the INTERVAL study
+
+#############################################################################################
+
+```{r}
+pub_dat <- read_excel("./input/Genomic atlas of serum proteins Tables.xlsx",sheet=2,skip=4,
+                      col_names = FALSE,na=c("",NA,"--"))
+pub_dat <- pub_dat[,-c(19)]
+
+names(pub_dat) <- c("id","protein","target","uniprot","r2_adj","sub_pass","age_beta_pub","age_se_pub","age_pval_pub",
+                    "female_beta_pub","female_se_pub","female_pval_pub","bmi_beta_pub","bmi_se_pub","bmi_pval_pub",
+                    "egfr_beta_pub","egfr_se_pub","egfr_pval_pub")
+
+pub_dat <- pub_dat %>% 
+  mutate(age_pval_pub = 10^(-1*age_pval_pub),
+         female_pval_pub = 10^(-1*female_pval_pub)) %>% 
+  select(id:female_pval_pub)
+
+```
+
+
+load a table of 5k Somamers
+
+```{r}
+translate_file <- read_excel("./input/translation file 5k new.xlsx")
+
+# filter high SNR Somamers, and generate "id" column
+tomatch <- translate_file %>% 
+  filter(seqid %in% high_markers) %>% 
+  dplyr::rename(gene = Gene,
+         protein = Target,
+         protein_full=Target_description,
+         marker = SomaID)%>% 
+  mutate(id = marker) %>% 
+  mutate(id = str_replace_all(id,"-",".")) %>% 
+  mutate(id = str_replace_all(id,"_",".")) %>% 
+  mutate(id = str_replace_all(id,",",".")) %>%
+  mutate(id = str_replace_all(id,"@",".")) %>%
+  mutate(id = str_replace_all(id," ",".")) %>%
+  mutate(id = str_replace_all(id,"(\\.)(\\.)",".")) 
+
+# merge INTERVAL markers with 5k markers
+matched_markers <- tomatch$marker[match(pub_dat$id, tomatch$id)]
+matched_markers <- unique(matched_markers[!is.na(matched_markers)])
+
+
+#convert to seqid
+matched_markers <- tibble::enframe(matched_markers,name = NULL,value = "SomaID")
+matched_markers <- left_join(matched_markers,translate_file[,1:2])
+matched_markers <- matched_markers$seqid
+
+
+tomatch <- tomatch %>% 
+  filter(seqid %in% matched_markers)
+
+
+# isolate INTERVAL proteins that correlate with age with p-value <1e-5
+age_proteins <- pub_dat$id[which(pub_dat[["age_pval_pub"]]<1e-5)]
+# filter only proteins present in 5k
+prev_age <- with(tomatch,marker[id %in% age_proteins])
+
+#convert to seqid
+prev_age <- tibble::enframe(prev_age,name = NULL,value = "SomaID")
+prev_age <- left_join(prev_age,translate_file[,1:2])
+prev_age <- prev_age$seqid
+
+# isolate INTERVAL proteins that correlate with sex with p-value <1e-5
+sex_proteins <- pub_dat$id[which(pub_dat[["female_pval_pub"]]<1e-5)]
+# filter only proteins present in 5k
+prev_sex <- with(tomatch,marker[id %in% sex_proteins])
+
+#convert to seqid
+prev_sex <- tibble::enframe(prev_sex,name = NULL,value = "SomaID")
+prev_sex <- left_join(prev_sex,translate_file[,1:2])
+prev_sex <- prev_sex$seqid
+
+```
+
+
+
+###############################################################
+Only Healthy Donors
+###############################################################
+
+```{r}
+# get coefficients for age and gender in HD cohort
+hd_results <- tsapply(matched_markers,function(char){
+    mod <- lm(data_5k_hd_noout[[char]]~age+gender,data=data_5k_hd_noout)
+  out <- c(as.numeric(summary(mod)$coefficients[2,c(1,4)]),as.numeric(summary(mod)$coefficients[3,c(1,4)]))
+  
+  if(char %notin% prev_age){out[c(1:2)] <- NA}
+  if(char %notin% prev_sex){out[c(3:4)] <- NA}
+  
+  names(out) <- c("age_beta_hd","age_pval_hd","female_beta_hd","female_pval_hd")
+  return(out)
+})
+
+hd_results <- as_tibble(hd_results) %>%
+  mutate(seqid = matched_markers) %>%
+  select(seqid,everything()) %>%
+  mutate(age_pval_hd = p.adjust(age_pval_hd,method="none")) %>%
+  mutate(female_pval_hd = p.adjust(female_pval_hd,method="none")) 
+
+hd_results <- inner_join(tomatch,hd_results,by="seqid") %>% 
+  select(id,marker,gene,protein,protein_full,everything()) 
+```
+
+
+
+#########################################
+  Compare to INTERVAL study
+#########################################
+
+```{r}
+pub_dat <- pub_dat %>% 
+  select(-protein,-target,-uniprot)
+
+new_results <- inner_join(hd_results,pub_dat,by="id")
+
+```
+
+
+isolate markers that are significant (p<0.05, no multiple comparison adjustment) in NDS HD cohort, significant in INTREVAL (p<1e-5) and have the same directionality
+
+```{r}
+age_to_adjust <- with(new_results,marker[which(age_pval_hd <= 0.05 & seqid %in% prev_age & sign(age_beta_hd)*sign(age_beta_pub)==1)])
+sex_to_adjust <- with(new_results,marker[which(female_pval_hd <= 0.05 & seqid %in% prev_sex & sign(female_beta_hd)*sign(female_beta_pub)==1)])
+```
+
+
+#############################################################################################
+
+ isolation of somamers significantly correlated with age and gender in the CHIANTI study
+
+#############################################################################################
+
+```{r}
+pub_dat2 <- read_csv("./input/chianti_data.csv")
+
+
+translate_file <- read_excel("./input/translation file 5k new.xlsx")
+
+tomatch2 <- translate_file %>% 
+  filter(seqid %in% high_markers) %>% 
+  dplyr::rename(gene = Gene,
+         protein = Target,
+         protein_full=Target_description,
+         marker = SomaID) %>% 
+  mutate(id = marker) %>% 
+  mutate(id = str_replace_all(id,"-",".")) %>% 
+  mutate(id = str_replace_all(id,"_",".")) %>% 
+  mutate(id = str_replace_all(id,",",".")) %>%
+  mutate(id = str_replace_all(id,"@",".")) %>%
+  mutate(id = str_replace_all(id," ",".")) %>%
+  mutate(id = str_replace_all(id,"(\\.)(\\.)",".")) 
+
+```
+
+
+merge CHIANTI markers with 5k markers
+
+```{r}
+matched_markers2 <- tomatch2$marker[match(pub_dat2$id, tomatch2$id)]
+matched_markers2 <- unique(matched_markers2[!is.na(matched_markers2)])
+
+tomatch2 <- tomatch2 %>% 
+  filter(marker %in% matched_markers2)
+
+#convert to seqid
+matched_markers2 <- tibble::enframe(matched_markers2,name = NULL,value = "SomaID")
+matched_markers2 <- left_join(matched_markers2,translate_file[,1:2])
+matched_markers2 <- matched_markers2$seqid
+```
+
+
+isolate CHIANTI proteins that correlate with age with p-value <5e-2
+```{r}
+age_proteins <- pub_dat2$id[which(pub_dat2[["age_pval_pub2"]]<5e-2)]
+
+# filter only proteins present in 5k
+
+prev_age2 <- with(tomatch2,marker[id %in% age_proteins])
+
+
+#convert to seqid
+prev_age2 <- tibble::enframe(prev_age2,name = NULL,value = "SomaID")
+prev_age2 <- left_join(prev_age2,translate_file[,1:2])
+prev_age2 <- prev_age2$seqid
+
+# isolate CHIANTI proteins that correlate with sex with p-value <5e-2
+sex_proteins <- pub_dat2$id[which(pub_dat2[["sex_pval_pub2"]]<5e-2)]
+
+# filter only proteins present in 5k
+prev_sex2 <- with(tomatch2,marker[id %in% sex_proteins])
+
+#convert to seqid
+prev_sex2 <- tibble::enframe(prev_sex2,name = NULL,value = "SomaID")
+prev_sex2 <- left_join(prev_sex2,translate_file[,1:2])
+prev_sex2 <- prev_sex2$seqid
+```
+
+
+###############################################################
+ Only Healthy Donors 
+###############################################################
+
+get coefficients for age and gender in HD cohort
+
+```{r}
+hd_results2 <- tsapply(matched_markers2,function(char){
+  mod <- lm(data_5k_hd_noout[[char]]~age+gender,data=data_5k_hd_noout)
+  out <- c(as.numeric(summary(mod)$coefficients[2,c(1,4)]),as.numeric(summary(mod)$coefficients[3,c(1,4)]))
+  
+  if(char %notin% prev_age2){out[c(1:2)] <- NA}
+  if(char %notin% prev_sex2){out[c(3:4)] <- NA}
+  
+  names(out) <- c("age_beta_hd","age_pval_hd","female_beta_hd","female_pval_hd")
+  return(out)
+})
+
+hd_results2 <- as_tibble(hd_results2) %>%
+  mutate(seqid = matched_markers2) %>%
+  select(seqid,everything()) %>%
+  mutate(age_pval_hd = p.adjust(age_pval_hd,method="none")) %>%
+  mutate(female_pval_hd = p.adjust(female_pval_hd,method="none")) 
+
+hd_results2 <- inner_join(tomatch2,hd_results2,by="seqid") %>% 
+  select(id,marker,gene,protein,protein_full,everything()) 
+```
+
+
+
+#########################################
+ Compare to CHIANTI 
+#########################################
+
+```{r}
+new_results2 <- inner_join(hd_results2,pub_dat2,by="id")
+```
+
+
+isolate markers that are significant (p<0.05, no multiple comparison adjustment) in NDS HD cohort, significant in CHIANTI (p<0.05) and have the same directionality
+
+```{r}
+age_to_adjust2 <- with(new_results2,marker[which(age_pval_hd <= 0.05 & seqid %in% prev_age & sign(age_beta_hd)*sign(age_beta_pub2)==1)])
+sex_to_adjust2 <- with(new_results2,marker[which(female_pval_hd <= 0.05 & seqid %in% prev_sex & sign(female_beta_hd)*sign(sex_beta_pub2)==1)])
+
+```
+
+
+merge with previous and isolate unique
+```{r}
+age_to_adjust <- unique(c(age_to_adjust,age_to_adjust2))
+sex_to_adjust <- unique(c(sex_to_adjust,sex_to_adjust2))
+
+```
+
+
+########################################################################
+  Additional HD results 
+########################################################################
+
+look at markers not already selected by INTREVAL and CHIANTI cohort 
+
+```{r}
+age_other_markers <- high_markers_soma[high_markers_soma %notin% age_to_adjust]
+sex_other_markers <- high_markers_soma[high_markers_soma %notin% sex_to_adjust]
+other_markers <- unique(c(age_other_markers,sex_other_markers))
+
+#convert to seqid
+other_markers <- tibble::enframe(other_markers,name = NULL,value = "SomaID")
+other_markers <- left_join(other_markers,translate_file[,1:2])
+other_markers <- other_markers$seqid
+
+age_other_markers <- tibble::enframe(age_other_markers,name = NULL,value = "SomaID")
+age_other_markers <- left_join(age_other_markers,translate_file[,1:2])
+age_other_markers <- age_other_markers$seqid
+
+sex_other_markers <- tibble::enframe(sex_other_markers,name = NULL,value = "SomaID")
+sex_other_markers <- left_join(sex_other_markers,translate_file[,1:2])
+sex_other_markers <- sex_other_markers$seqid
+```
+
+
+get coefficients 
+
+```{r}
+hd_other_results <- tsapply(other_markers,function(char){
+  mod <- lm(data_5k_hd_noout[[char]]~age+gender,data=data_5k_hd_noout)
+  out <- c(as.numeric(summary(mod)$coefficients[2,c(1,4)]),as.numeric(summary(mod)$coefficients[3,c(1,4)]))
+  
+  if(char %notin% age_other_markers){out[c(1:2)] <- NA}
+  if(char %notin% sex_other_markers){out[c(3:4)] <- NA}
+  
+  names(out) <- c("age_beta_hd","age_pval_hd","female_beta_hd","female_pval_hd")
+  return(out)
+})
+
+# adjust for multiple comparisons by running FDR adjustment 
+hd_other_results <- as_tibble(hd_other_results) %>%
+  mutate(marker = other_markers) %>%
+  select(marker,everything()) %>%
+  mutate(age_pval_hd = p.adjust(age_pval_hd,method = "fdr" )) %>%
+  mutate(female_pval_hd = p.adjust(female_pval_hd,method="fdr"))
+
+
+trans_file <- translate_file
+names(trans_file)[2] <- "marker"
+names(trans_file) <- tolower(names(trans_file))
+
+hd_other_results <- inner_join(trans_file,hd_other_results,by="marker") %>%
+  select(somaid,marker,gene,target,target_description,everything())
+
+new_age <- with(hd_other_results,somaid[age_pval_hd<=0.05 & !is.na(age_pval_hd)])
+new_sex <- with(hd_other_results,somaid[female_pval_hd<=0.05 & !is.na(female_pval_hd)])
+
+print(paste0("new age: ",length(new_age), " & new sex: ",length(new_sex)))
+
+```
+
+merge with previously identified markers 
+
+```{r}
+age_to_adjust <- c(age_to_adjust,new_age)
+sex_to_adjust <- c(sex_to_adjust,new_sex)
+
+# convert to seqid
+age_to_adjust <- tibble::enframe(age_to_adjust,name = NULL,value = "SomaID")
+age_to_adjust <- left_join(age_to_adjust,translate_file[,1:2])
+age_to_adjust <- age_to_adjust$seqid
+
+sex_to_adjust <- tibble::enframe(sex_to_adjust,name = NULL,value = "SomaID")
+sex_to_adjust <- left_join(sex_to_adjust,translate_file[,1:2])
+sex_to_adjust <- sex_to_adjust$seqid
+
+
+print(paste0("# age to adjust: ",length(age_to_adjust), " & # sex to adjust: ",length(sex_to_adjust)))
+```
+
+```{r}
+writeLines(age_to_adjust,"./input/age_to_adjust.txt")
+writeLines(sex_to_adjust,"./input/sex_to_adjust.txt")
+```
+
+
+
+run lm in HD cohort for all somamers
+
+```{r}
+hd_results_to_save <- tsapply(high_markers,function(char){
+  mod <- lm(data_5k_hd_noout[[char]]~age+gender,data=data_5k_hd_noout)
+  out <- c(as.numeric(summary(mod)$coefficients[2,c(1,4)]),as.numeric(summary(mod)$coefficients[3,c(1,4)]))
+  
+  names(out) <- c("age_beta_hd","age_pval_hd","female_beta_hd","female_pval_hd")
+  return(out)
+})
+
+# adjust for multiple comparisons by running FDR adjustment 
+hd_results_to_save <- as_tibble(hd_results_to_save) %>%
+  mutate(marker = high_markers) %>%
+  select(marker,everything()) %>%
+  mutate(age_pval_hd = p.adjust(age_pval_hd,method = "fdr" )) %>%
+  mutate(female_pval_hd = p.adjust(female_pval_hd,method="fdr"))
+ 
+
+```
+
+
+
+######################################################
+adjust for age and sex using significant somamers
+######################################################
+
+```{r}
+adjust_function <- function(y_char,data=new,alpha_val=0.05,...){
+  # y_char <- "SL000001/SL000002"
+  # y_char <- "SL000001"
+  # data <- new
+  y<-data[[y_char]]
+  if(any(str_detect(y_char,c(age_to_adjust,sex_to_adjust)))){
+    
+    if(any(str_detect(y_char,age_to_adjust)) & any(str_detect(y_char,sex_to_adjust))){
+      mod <- lm(y~age+gender,data)
+    }else{
+      if(any(str_detect(y_char,age_to_adjust))){
+        mod <- lm(y~age,data)
+      }
+      if(any(str_detect(y_char,sex_to_adjust))){
+        mod <- lm(y~gender,data)
+      }
+    }
+  }else{
+    mod <- lm(y~1)
+  }
+  return(mod)
+}
+
+soma_new <- data_5k_log
+
+soma_new_adj <- foreach(i=1:length(high_markers),.final=as.data.table,.packages=c("dplyr")) %do% {
+  mod <- adjust_function(high_markers[i],data=data_5k_hd_noout)
+  (soma_new[[high_markers[i]]] - predict(mod,newdata=soma_new))
+}
+
+names(soma_new_adj) <- high_markers
+soma_new_adj[,sampleid := soma_new$sampleid]
+setcolorder(soma_new_adj,c("sampleid"))
+
+
+```
+
+
+#############################################
+#############################################
+    scale to mean 0 and sd of 1 in HD
+#############################################
+#############################################
+
+```{r}
+# isolate HD data only
+
+soma_adj_demo <- merge(demo_5k,soma_new_adj,all.y=TRUE)
+
+data_hd <- soma_adj_demo %>% 
+  filter(diagnosis=="HD")
+
+# remove outliers in the HD cohort
+
+data_hd_noout <- remout_fun(dat = data_hd,outcomes = high_markers,mult = 1.5)
+
+a <- as.data.frame(apply(data_hd_noout[,high_markers], MARGIN = 1,function(x) sum(is.na(x))))
+
+# get means and sd of HD
+means <- apply(data_hd_noout[,high_markers],MARGIN = 2,FUN = function(x){mean(x,na.rm=TRUE)})
+stdev <- apply(data_hd_noout[,high_markers],MARGIN = 2,FUN = function(x){sd(x,na.rm=TRUE)})
+
+data_scaled <- soma_adj_demo %>% 
+  dplyr::select(-all_of(high_markers))
+
+for(i in 1:length(high_markers)){
+  # i <- 1
+  data_scaled[,high_markers[i]] <- (soma_adj_demo[,high_markers[i]] - means[i]) / stdev[i]
+}
+
+#check if mean is 0 and sd is 1:
+
+data_hd_new <- data_scaled %>% 
+  filter(diagnosis=="HD")
+
+means <- apply(data_hd_new[,high_markers],MARGIN = 2,FUN = mean)
+stdev <- apply(data_hd_new[,high_markers],MARGIN = 2,FUN = sd)
+
+
+```
+
+
+adjust outliers above and below 3*IQR to the value of the outlier cutoff value
+
+
+```{r}
+data_noout_curb <- curb_fun(dat = data_all,outcomes = vars,mult = 3)
+
+# save files 
+
+write_csv(data_noout_curb,"./input/soma_highSNR_adj_scaled_3_iqr_curbed.csv")
+
+```
+

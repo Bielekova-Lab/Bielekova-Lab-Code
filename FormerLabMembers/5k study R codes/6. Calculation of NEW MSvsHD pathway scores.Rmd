@@ -1,0 +1,495 @@
+---
+title: "Generation of new non-IPA pathway in 5k dataset for somamers that differentiate MS from HD"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  html_notebook: default
+---
+
+THIS SCRIPT identifies somamers not used in any of the IPA pathways for MS vs HD and uses 
+correlations to group them and generate new unannotated pthways 
+
+- using HD age/sex-adjusted and HD scaled and CURBED somamers (3714 somamers)
+
+
+###################
+
+Set the environment 
+
+```{r}
+
+remove(list = ls())
+
+
+library(readr, quietly = TRUE)
+library(readxl, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(data.table, quietly = TRUE)
+library(foreach, quietly = TRUE)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(lme4)
+library(ggpubr)
+library(openxlsx)
+library(glmnet)
+library(tidyr)
+library(broom)
+library(REdaS)
+library(vioplot)
+library(epiR)
+library(broom)
+library(MatchIt)
+library(gridExtra)
+library(rstatix)
+library(ggcorrplot)
+
+```
+
+
+load functions
+
+```{r}
+'%notin%' <- function(x,y)!('%in%'(x,y))
+
+
+tsapply <- function(...){t(sapply(...))}
+
+
+
+ 
+cor_est <- function(x,y,...){
+  obj <- cor.test(x,y,...)
+  val <- obj$estimate
+  return(round(as.numeric(val),digits = 3))
+}
+cor_pval <- function(x,y,...){
+  obj <- cor.test(x,y,...)
+  pval <- obj$p.value
+  return(as.numeric(pval))
+}
+
+
+corr_fun <- function(dat,outcomes,high_markers,...){
+    dat_est <- sapply(outcomes,function(ychar){
+    sapply(high_markers,function(xchar){
+      cor_est(dat[[xchar]],dat[[ychar]],method="spearman")
+    })
+  })
+  
+ 
+  dat_pval <- sapply(outcomes,function(ychar){sapply(high_markers,function(xchar){
+    cor_pval(dat[[xchar]],dat[[ychar]],method="spearman")})})
+  
+  
+  dat_pval <- as_tibble(dat_pval) %>% 
+    mutate_all(p.adjust,method="fdr") %>%
+    mutate(marker = high_markers,type="p-value") %>%  
+    dplyr::select(marker,type,everything()) 
+  
+  dat_est <- as_tibble(dat_est) %>% 
+    mutate(marker = high_markers,type="spearman") %>% 
+    dplyr::select(marker,type,everything())
+  
+  dat_results <- bind_rows(dat_est,dat_pval) # stack em up
+  dat_results <- dat_results %>% 
+    gather(key,value,outcomes) 
+ 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    mutate(type=factor(type,levels=c("spearman","p-value"))) %>% 
+    arrange(marker,key,type) %>%    
+    mutate(key = paste(as.character(key),type)) %>% 
+    dplyr::select(-type) 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    spread(key,value) 
+  
+  
+  
+  return(dat_results)
+}
+
+
+
+
+```
+
+Load raw data
+
+```{r}
+demo_5k <- read_csv("./input/outcomes_5k.csv")
+transl_5k <- read_excel("./input/translation file 5k new.xlsx")
+
+soma_scaled <- fread("./input/soma_highSNR_adj_scaled_3_iqr_curbed.csv")
+
+high_markers <- readLines("./input/high_SNR_markers.txt")
+
+
+
+markers_5k <- transl_5k$SomaID
+seqid_5k <- transl_5k$seqid
+
+```
+
+
+filter untreated MS samples only
+```{r}
+
+# isolate untreated MS samples only 
+
+ms_only <- soma_scaled %>% 
+  filter(diagnosis %in% c("RR-MS","PP-MS","SP-MS")) %>%
+  filter(nice_therapy=="Untreated")
+
+```
+
+################################################################################
+################################################################################
+#
+#  get somamers for each pathways
+#
+################################################################################
+################################################################################
+
+```{r}
+# load pathway data
+
+pathway_data <- read_csv("./input/ipa_ms_vs_hd_pathways_soma_summary.csv")
+
+# isolate used somamers
+
+ipa_markers <- pathway_data %>% 
+  filter(nr_pathways>0)
+ipa_markers <- ipa_markers$seqid
+
+# load MS_vs_HD differences
+
+  corrs <- read_csv("./input/ms_vs_hd_forIPA_selection.csv")
+
+# isolate somamers not used in IPA scores
+
+not_used <- corrs %>% 
+  filter(marker %notin% ipa_markers)
+
+not_used <- not_used$marker
+
+
+```
+
+GENERATE NEW PATHWAYS from unused somamers
+
+```{r}
+# generate a correlation matrix of these
+working_data <- ms_only %>% 
+  dplyr::select(all_of(not_used))
+
+corr <- cor(working_data,method = "spearman")
+corr[(corr)==1] <- NA
+
+# generate histogram of Rho
+new_vector <- tibble::enframe(c(corr),name = NULL,value = "cor")
+med <- median(new_vector$cor,na.rm=TRUE)
+
+# remove all correlations below abs(0.7)
+new_vector_clean <- new_vector %>% 
+  filter(!is.na(cor)) %>% 
+  filter(abs(cor)>=0.7)
+med_clean <- median(new_vector_clean$cor,na.rm=TRUE)
+
+
+
+#################################
+##
+#  generate new pathways
+##
+#################################
+
+# turn correlation matrix into dataframe
+mat <- as_tibble(corr)
+# give it "seqid" column
+mat$seqid <- names(mat)
+
+# generate a dataframe with all somamers to new pathways
+newcluster_results <- tibble::enframe(not_used,name = NULL,value = "seqid")
+
+used_markers <- vector()
+
+for(i in 1:length(not_used)){
+  # i <- 1
+  # isolate working markers that have not been used previosuly
+  markers_iter <- not_used[which(not_used%notin%used_markers)]
+  
+  # generate correlation matrix with desired set of somamers (all that have 
+  # not been used for previous iteration)  
+  mat_working <- mat %>% 
+    filter(seqid %in% markers_iter) %>% 
+    dplyr::select(all_of(markers_iter),seqid)
+  
+  ##############
+  # identify top correlating pair 
+  
+  # identify maximum value in each column 
+  top <- mat_working %>% 
+    dplyr::summarise_at(., .vars = markers_iter,.funs = function(x){max(abs(x),na.rm=TRUE)})
+  
+  # turn it into dataframe
+  top <- tibble::enframe((t(as.matrix(top))),name = "marker",value = "max_rho")
+  
+  # arrange based on descending rho value and isolate top two somamers - 
+  # these are the seed for the loop
+  top <- top %>%
+    dplyr::arrange(desc(max_rho)) %>% 
+    slice_head(n=2)
+  
+  # check if the top correlation still passes the 0.7 cutoff, 
+  # if not, break the loop
+  if(abs(top$max_rho[1])<=0.7){
+        break
+  }
+  
+  # turn them into a vector
+  top <- top$marker
+  
+  # remove them from the working markers 
+  working_markers <- markers_iter[-which(markers_iter%in%top)]
+  
+  # loop through working markers to identify those that correlate 
+  # with the rest of the marker with cut-off > abs(0.5)
+  
+  for(k in 1:length(working_markers)){
+    # k <- 1
+    # isolate top markers 
+    to_test <- mat_working %>% 
+      filter(seqid%in%top) %>% 
+      dplyr::select(-all_of(top))
+    
+    # length(names(to_test)[-length(names(to_test))])
+    
+    # sum up abs rho for all somamers
+    sum_rho <- to_test %>% 
+      dplyr::summarise_at(.vars = names(to_test)[-length(names(to_test))],.funs = function(x){sum(abs(x),na.rm = TRUE)})
+    
+    # turn into dataframe
+    sum_rho_t <- as_tibble(t(sum_rho))
+    # rename column 
+    names(sum_rho_t) <- "rho"
+    # add column with seid
+    sum_rho_t$seqid <- names(sum_rho)
+    
+    # arrange by descending Rho
+    sum_rho_t <- sum_rho_t %>% 
+      dplyr::arrange(desc(abs(rho)))
+    
+    # isolate the top somamer
+    new_rho <- sum_rho_t$seqid[1]
+    
+    # test its correlation with the rest of the somamers - if it passes 
+    # cutoff - the number remains, if it's below cut-off, it's replaced by NA
+    to_test_na <- to_test %>% 
+      dplyr::mutate_at(.vars = names(to_test)[-length(names(to_test))],.funs = function(x) {ifelse(test = abs(x)<=0.7,yes = NA,no = x)})
+    
+    # test whether new somamer contains NAs
+    
+    
+    if(sum(which(is.na(to_test_na[[new_rho]])))>0){
+      top <- top
+      break}
+    else{
+      top <- c(top,new_rho)
+      
+    }
+  }
+  
+  # add selected markers on the list of used markers
+  used_markers <- c(used_markers,top)
+  
+  # add results to summary dataframe
+  to_add <- tibble::enframe(top,name = NULL,value = "seqid")
+  to_add[[paste0("New_pathway_",i)]] <- 1
+  
+  newcluster_results <- left_join(newcluster_results,to_add,by="seqid")
+  
+  print(i)
+  print(length(markers_iter))
+  # eliminate pathways with less than 5 somamers
+  
+  to_eliminate <- tibble::enframe(apply(newcluster_results[,-1],MARGIN = 2,FUN = sum, na.rm=TRUE),name = "pathway",value = "nr_soma")
+  
+  # filter pathways with less than 5
+  to_eliminate <- to_eliminate %>% 
+    filter(nr_soma<5)
+  to_eliminate <- to_eliminate$pathway
+  
+  #remove these pathways from the result dataframe
+  newcluster_results <- newcluster_results %>% 
+    dplyr::select(-all_of(to_eliminate))
+}
+
+# merge with translation file 
+
+newcluster_results <- merge(transl_5k[,1:3],newcluster_results,all.y = TRUE,by="seqid")
+
+
+
+
+```
+
+
+GENERATE PATHWAY SCORES for unannotated pathways 
+
+```{r}
+# isolate samples of interest
+
+samples_interest <- soma_scaled %>% 
+  # filter(nice_therapy=="Untreated") %>% 
+  filter(diagnosis_simple %in% c("RR-MS","prog-MS","HD"))
+  
+
+samples <- samples_interest$sampleid
+
+
+# transpose soma data
+
+data_5k <- soma_scaled %>% 
+  dplyr::select(sampleid,all_of(high_markers))
+ 
+soma_scaled_t <- as.data.frame(t(as.matrix(data_5k)))
+
+names(soma_scaled_t) <- soma_scaled_t[1,]
+soma_scaled_t <- soma_scaled_t[-1,]
+
+soma_scaled_t$somaid <- rownames(soma_scaled_t)
+
+rownames(soma_scaled_t) <- NULL
+
+
+soma_scaled_t <- soma_scaled_t %>% 
+  select(somaid,everything()) 
+
+soma_scaled_t <- soma_scaled_t %>% 
+  mutate_at(.vars = names(soma_scaled_t)[-1],.funs = as.numeric)
+
+class(soma_scaled_t$`S-181218-03143`)
+
+soma_selection <- soma_scaled_t %>% 
+  select(somaid,all_of(samples))
+
+names(soma_selection)[1] <- "marker"
+
+
+
+###################################################
+# generate a dataframe of pathways and somamers
+###################################################
+
+pathway_data <- data.frame(matrix(ncol = 2,nrow = 0))
+names(pathway_data) <- c("marker","pathway")
+  
+for(i in 1:length(pathways)){
+    # i <- 1
+    working_data <- newcluster_results[,c("seqid",pathways[i])]
+    working_data <- working_data[which(working_data[[pathways[i]]]==1),]
+    names(working_data) <- c("marker","pathway")
+    working_data$pathway <- pathways[i]
+  pathway_data <- rbind(pathway_data,working_data)  
+  }
+
+# load correlation of somamers with GMSdis outcome
+
+  corrs <- read_csv("./input/ms_vs_hd_forIPA_selection.csv")
+
+
+pathway_data <- merge(pathway_data,corrs,by="marker",all.x = TRUE)
+
+
+
+# 
+# get a dataframe of pathways for progression score
+
+results <- tibble::enframe(x = samples,name = NULL,value = "sampleid")
+
+nr_soma <- vector()
+cor_dir_sum <- vector()
+
+# generate a file for supplementary table - summary of pathways  
+
+summary_pathways <- data.frame(matrix(nrow = 0,ncol = 6))
+
+names(summary_pathways) <- c("pathway","type","method","seqid","gene","coefficient")
+
+for(j in 1:length(pathways)){
+# j <- 1
+  
+selection <- pathway_data %>% 
+    filter(pathway==pathways[j])
+  
+  pathways_data <- selection %>% 
+    dplyr::select(marker,gene,ms_hd_median_diff)
+
+  # merge with seqid data
+  
+  data_soma <- merge(pathways_data,soma_selection, by="marker",all.x = TRUE)
+  
+ 
+  final_data <- data_soma
+  
+  final_data[,samples] <- final_data$ms_hd_median_diff * final_data[,samples]
+  
+  nr_somamers <- length(final_data$marker)
+  
+  # calculate the score
+  
+  score <- apply(final_data[,samples],MARGIN = 2,FUN = sum, na.rm=TRUE)
+  # score <- apply(final_data[,samples],MARGIN = 2,FUN = mean, na.rm=TRUE)
+  
+  # mutliply score by sign of the sum of correlation coefficient for the pathway
+  
+  cor_dir <- ifelse(sum(final_data$ms_hd_median_diff)>0,yes = 1,no = -1)
+  
+  cor_dir_sum <- c(cor_dir_sum,sum(final_data$ms_hd_median_diff))
+  
+  score <- score * cor_dir
+  
+  # score <- score / nr_somamers
+  results[[paste0(pathways[j],"_score")]] <- score  
+  
+  # selected somamers
+  
+  nr_soma <- c(nr_soma,nr_somamers)
+  
+  #for summary
+  for_summary <- final_data %>% 
+    mutate(pathway=pathways[j]) %>% 
+    mutate(type="ms vs hd") %>% 
+    mutate(method="clustering") %>% 
+    dplyr::select(pathway,type,method,marker,gene,ms_hd_median_diff) %>% 
+    dplyr::rename(somaid=marker) %>% 
+    dplyr::rename(coefficient=ms_hd_median_diff)
+  
+  summary_pathways <- rbind(summary_pathways,for_summary)
+
+      
+}
+
+nr_soma_for_scores <- tibble::enframe(pathways,name = NULL,value = "pathway")
+
+nr_soma_for_scores$nr_soma <- nr_soma
+
+write_csv(nr_soma_for_scores,"./output/MS_vs_HD/new_nr_soma_in_scores.csv")
+
+
+
+
+write_csv(results,"./output/MS_vs_HD/new_ms_vs_hd_scores.csv")
+
+
+# save summary pathways 
+
+write_csv(summary_pathways,"./output/MS_vs_HD/new_ms_vs_hd_summary_pathways.csv")
+```
+```
+

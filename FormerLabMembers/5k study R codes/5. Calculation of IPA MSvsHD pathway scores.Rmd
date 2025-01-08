@@ -1,0 +1,287 @@
+---
+title: "Calculation of pathway scores that differemtiates MS from HD in 5k dataset"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  html_notebook: default
+---
+
+THIS SCRIPT calculates pathway scores for MS vs HD difference
+
+_ only pathways with -log10(pval)>5 were considered
+
+- MS vs HD difference sign used for directionality 
+
+- scores calculated using HD age/sex-adjusted and HD scaled somamers (3714 somamers - human only) with outliers CURBED
+
+
+###################
+
+Set the environment 
+
+```{r}
+
+remove(list = ls())
+
+
+library(readr, quietly = TRUE)
+library(readxl, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(data.table, quietly = TRUE)
+library(foreach, quietly = TRUE)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(lme4)
+library(ggpubr)
+library(openxlsx)
+library(glmnet)
+library(tidyr)
+library(broom)
+library(REdaS)
+library(vioplot)
+library(epiR)
+library(broom)
+library(MatchIt)
+library(gridExtra)
+library(rstatix)
+
+```
+
+
+load functions
+
+```{r}
+'%notin%' <- function(x,y)!('%in%'(x,y))
+
+
+```
+
+Load raw data
+
+```{r}
+
+# load vector of high-signaling somamers
+
+high_markers <- readLines("./input/high_SNR_markers.txt")
+
+
+# load curbed dataset
+
+data <- fread("./input/soma_highSNR_adj_scaled_3_iqr_curbed.csv")
+
+
+
+
+# select only somamers of interest and only untreated MS and HD samples
+
+data <- data %>% 
+  # filter(nice_therapy=="Untreated") %>% 
+   filter(diagnosis %in% c("HD","RR-MS","SP-MS","PP-MS"))
+
+table(data$diagnosis)
+
+
+
+
+demo_5k <- read_csv("./input/outcomes_5k.csv")
+transl_5k <- read_excel("./input/translation file 5k new.xlsx")
+
+
+markers_5k <- transl_5k$SomaID
+seqid_5k <- transl_5k$seqid
+
+```
+
+
+```{r}
+
+# isolate samples of interest
+
+samples <- data$sampleid
+
+# isolate somamers data only 
+
+soma_scaled <- data %>% 
+  dplyr::select(sampleid,all_of(high_markers))
+
+# transpose the data
+
+soma_scaled_t <- as.data.frame(t(as.matrix(soma_scaled)))
+
+names(soma_scaled_t) <- soma_scaled_t[1,]
+soma_scaled_t <- soma_scaled_t[-1,]
+
+soma_scaled_t$somaid <- rownames(soma_scaled_t)
+
+rownames(soma_scaled_t) <- NULL
+
+soma_scaled_t <- soma_scaled_t %>% 
+  select(somaid,everything()) 
+
+soma_scaled_t <- soma_scaled_t %>% 
+  mutate_at(.vars = names(soma_scaled_t)[-1],.funs = as.numeric)
+
+class(soma_scaled_t$`S-181218-03143`)
+
+soma_selection <- soma_scaled_t %>% 
+  select(somaid,all_of(samples))
+
+
+
+```
+
+
+################################################################################
+################################################################################
+#
+#  get somamers for each pathways
+#
+################################################################################
+################################################################################
+
+```{r}
+# load pathway data
+
+pathway_data <- read_excel("./input/IPA_pathways_all.xlsx")
+
+# isolate pathways for GMS disability outcome and filter pathwyas with -log10(pval) > 5 
+
+pathway_data <- pathway_data %>% 
+  filter(outcome=="Disease effects: MS vs HD") %>% 
+  filter(pval>5)
+
+# generate vector of unique pathways
+
+pathways <- sort(unique(pathway_data$pathway))
+
+
+# load correlation of somamers with GMSdis outcome
+
+  corr <- read_csv("./Figures/IPA_analysis_files/ms_vs_hd_forIPA_selection.csv")
+  
+  corr$assigned_directionality <- ifelse(corr$ms_hd_median_diff<0,yes = -1,no = 1)
+
+  names(corr)[1] <- "somaid"
+  
+  # merge with soma data
+
+soma_selection <- left_join(corr,soma_selection,by="somaid")
+```
+
+
+############################
+#########################
+MS vs HD PATHWAY SCORES calculation
+#########################
+############################
+
+```{r}
+# get a dataframe of pathways for progression score
+
+results <- tibble::enframe(x = samples,name = NULL,value = "sampleid")
+
+pathway_soma <- tibble::enframe(soma_selection$somaid,name = NULL,value = "somaid")
+
+which(pathways=="Wound Healing Signaling Pathway")
+
+nr_soma <- vector()
+
+cor_dir_sum <- vector()
+
+# generate a file for supplementary table - summary of pathways  
+
+summary_pathways <- data.frame(matrix(nrow = 0,ncol = 6))
+
+names(summary_pathways) <- c("pathway","type","method","seqid","gene","coefficient")
+
+for(j in 1:length(pathways)){
+# j <- 1
+  
+selection <- pathway_data %>% 
+    filter(pathway==pathways[j])
+  
+# get a vector of markers
+markers <- strsplit(selection$molecules,"[,/ -()]")[[1]]
+
+  # isolate required data
+  
+  final_data <- soma_selection %>% 
+    filter(gene %in% markers)
+  
+ 
+  # final_data[,samples] <- final_data$assigned_directionality * final_data[,samples]
+  
+  final_data[,samples] <- final_data$ms_hd_median_diff * final_data[,samples]
+  
+  cor_dir_sum <- c(cor_dir_sum,sum(final_data$ms_hd_median_diff))
+  
+  nr_somamers <- length(final_data$somaid)
+  
+  # calculate the score
+  
+  score <- apply(final_data[,samples],MARGIN = 2,FUN = sum, na.rm=TRUE)
+  # score <- apply(final_data[,samples],MARGIN = 2,FUN = mean, na.rm=TRUE)
+  
+  # mutliply score by sign of the sum of median differences between MS and HD for the pathway
+  
+  cor_dir <- ifelse(sum(final_data$ms_hd_median_diff)>0,yes = 1,no = -1)
+  
+  score <- score * cor_dir
+  # score <- score / nr_somamers
+  results[[paste0("pathway_",j,"_score")]] <- score  
+  
+  # selected somamers
+  pathway_soma[[paste0("pathway_",j,"_score")]] <- NA
+  
+  pathway_soma[which(pathway_soma$somaid %in% final_data$somaid),j+1] <- 1
+  pathway_soma[which(pathway_soma$somaid %notin% final_data$somaid),j+1] <- 0
+
+  nr_soma <- c(nr_soma,nr_somamers)
+  
+  #for summary
+  for_summary <- final_data %>% 
+    mutate(pathway=pathways[j]) %>% 
+    mutate(type="ms vs hd") %>% 
+    mutate(method="IPA") %>% 
+    dplyr::select(pathway,type,method,somaid,gene,ms_hd_median_diff) %>% 
+    dplyr::rename(coefficient=ms_hd_median_diff)
+  
+  summary_pathways <- rbind(summary_pathways,for_summary)
+
+      
+}
+
+nr_soma_for_scores <- tibble::enframe(pathways,name = NULL,value = "pathway")
+
+nr_soma_for_scores$nr_soma <- nr_soma
+
+write_csv(nr_soma_for_scores,"./output/MS_vs_HD/nr_soma_in_scores_ms_vs_hd.csv")
+
+coef_data <- tibble::enframe(pathways,name = NULL,value = "pathway")
+
+# coef_data$GMSdis_Rho_mean <- cor_dir_mean
+coef_data$MS_vs_HD_median_diff <- cor_dir_sum
+
+
+final_scores_tosave <- results
+
+names(final_scores_tosave)[which(grepl("pathway",names(final_scores_tosave)))] <- pathways
+
+
+write_csv(final_scores_tosave,"./output/MS_vs_HD/ms_vs_hd_pathways_scores.csv")
+
+# save soma selection in pathways 
+names(pathway_soma)[which(grepl("pathway",names(pathway_soma)))] <- pathways
+
+names(pathway_soma)[1] <- "seqid"
+
+pathway_soma <- right_join(transl_5k[,-1],pathway_soma)
+
+write_csv(pathway_soma,"./output/MS_vs_HD/soma_selection_in_ms_vs_hd_pathways.csv")
+
+# save summary pathways 
+
+write_csv(summary_pathways,"./output/MS_vs_HD/ms_vs_hd_summary_pathways.csv")
+```

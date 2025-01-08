@@ -1,0 +1,244 @@
+---
+title: "Calculation of propensity-matched groups"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  html_notebook: default
+---
+
+THIS SCRIPT identifies propensity matched groups of patients
+with proportionally diffreent BD/T2LL/CombiWISE
+
+
+###################
+
+Set the environment 
+
+```{r}
+
+remove(list = ls())
+
+library(readr, quietly = TRUE)
+library(readxl, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(data.table, quietly = TRUE)
+library(foreach, quietly = TRUE)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(lme4)
+library(ggpubr)
+library(openxlsx)
+library(glmnet)
+library(tidyr)
+library(broom)
+library(REdaS)
+library(vioplot)
+library(epiR)
+library(broom)
+library(MatchIt)
+library(gridExtra)
+
+```
+
+
+load functions
+
+```{r}
+'%notin%' <- function(x,y)!('%in%'(x,y))
+
+
+tsapply <- function(...){t(sapply(...))}
+
+
+ 
+cor_est <- function(x,y,...){
+  obj <- cor.test(x,y,...)
+  val <- obj$estimate
+  return(round(as.numeric(val),digits = 3))
+}
+cor_pval <- function(x,y,...){
+  obj <- cor.test(x,y,...)
+  pval <- obj$p.value
+  return(as.numeric(pval))
+}
+
+
+corr_fun <- function(dat,outcomes,high_markers,...){
+    dat_est <- sapply(outcomes,function(ychar){
+    sapply(high_markers,function(xchar){
+      cor_est(dat[[xchar]],dat[[ychar]],method="spearman")
+    })
+  })
+  
+ 
+  dat_pval <- sapply(outcomes,function(ychar){sapply(high_markers,function(xchar){
+    cor_pval(dat[[xchar]],dat[[ychar]],method="spearman")})})
+  
+  
+  dat_pval <- as_tibble(dat_pval) %>% 
+    mutate_all(p.adjust,method="fdr") %>%
+    mutate(marker = high_markers,type="p-value") %>%  
+    dplyr::select(marker,type,everything()) 
+  
+  dat_est <- as_tibble(dat_est) %>% 
+    mutate(marker = high_markers,type="spearman") %>% 
+    dplyr::select(marker,type,everything())
+  
+  dat_results <- bind_rows(dat_est,dat_pval) # stack em up
+  dat_results <- dat_results %>% 
+    gather(key,value,outcomes) 
+ 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    mutate(type=factor(type,levels=c("spearman","p-value"))) %>% 
+    arrange(marker,key,type) %>%    
+    mutate(key = paste(as.character(key),type)) %>% 
+    dplyr::select(-type) 
+  
+  dat_results <- dat_results %>% 
+    mutate(key = factor(key,levels=unique(dat_results$key))) %>% 
+    spread(key,value) 
+  
+  
+  
+  return(dat_results)
+}
+
+
+
+```
+
+Load raw data
+
+```{r}
+demo_5k <- read_csv("./input/outcomes_5k.csv")
+transl_5k <- read_excel("./input/translation file 5k new.xlsx")
+
+# isolate MS samples only 
+ms_only <- demo_5k %>% 
+  filter(diagnosis %in% c("RR-MS","SP-MS","PP-MS") & nice_therapy=="Untreated") %>% 
+  mutate(cohort="MS")
+
+```
+
+
+Propensity score matching 
+
+```{r}
+
+###############################################################
+# # set variable
+###############################################################
+
+comp_var <- c("t2_vs_bd","bd_vs_t2","combi_vs_bd","bd_vs_combi")
+
+var1 <- c("t2ll","brain_damage","combiwise","brain_damage")
+var2 <- c("brain_damage","t2ll","brain_damage","combiwise")
+
+var1_short <- c("t2","bd","combi","bd")
+var2_short <- c("bd","t2","bd","combi")
+
+psm_method <- c("full","full","full","full")
+
+
+
+for(j in 1:length(comp_var)){
+    # j <- 1
+    
+    # get a subset with no NAs
+      data_ms_sub <- ms_only %>% 
+      filter(!is.na(ms_only[var1[j]]) & !is.na(ms_only[var2[j]]))
+    
+    #####################################################
+    # identify quartiles of var1
+    
+    # calculate regression 
+    f <- as.formula(paste(var1[j],var2[j],sep="~"))
+    
+    lm_mod_1 <- lm(data = data_ms_sub,formula = f)
+    
+    #get residuals
+    data_ms_sub$res1 <- lm_mod_1$residuals
+    
+    # calculate quartiles
+    hist(data_ms_sub$res1)
+    
+    
+    quant <- quantile(data_ms_sub$res1)
+    
+    q1 <- as.numeric(quant[2])
+    q2 <- as.numeric(quant[4])
+    
+    
+    data_ms_sub$mark <- NA
+    ind_q1 <- which(data_ms_sub$res1 <= q1)
+    ind_q2 <- which(data_ms_sub$res1 >= q2)
+    
+    data_ms_sub$mark[ind_q1] <- "q1"
+    data_ms_sub$mark[ind_q2] <- "q3"
+    
+    ggplot(data_ms_sub,aes_string(y=var1[j],x=var2[j]))+
+      geom_point(aes(color=mark)) 
+    
+    write_csv(data_ms_sub,paste0("./output/propensity/",comp_var[j],"_FULL_propensity_data.csv"))
+    
+    # remove middle two quartiles
+    data_ms_sub_nona <- data_ms_sub %>% 
+      filter(!is.na(mark))
+    
+    p <- ggplot(data=data_ms_sub_nona,aes_string(y=var1[j],x=var2[j]))+
+      geom_point(aes(color=mark),alpha = 0.6, shape = 1, size = 3,stroke = 0.6,)+
+      geom_smooth(data = data_ms_sub, method = "lm") +
+      scale_colour_discrete(labels = c("<Q1", ">Q3"))+
+      theme_bw()
+    p
+    
+   
+    table(data_ms_sub_nona$mark)
+    
+    
+
+    # propensity score matching
+    
+    df <- data_ms_sub_nona
+    df$group <- df$mark
+    df$group <- df$group=="q1"
+    
+    set.seed(1234)
+    f <- as.formula(paste0("group~",var2[j]))
+    match.it <- matchit(f,data = df, method =  psm_method[j])
+    a <- summary(match.it)
+    plot(match.it)
+    
+    df.match <- match.data(match.it)
+    
+    df_q1 <- df.match %>% 
+      dplyr::group_by(subclass) %>% 
+      arrange(desc(abs(res1))) %>%
+      arrange(weights) %>%
+      filter(mark=="q1") %>% 
+      filter(row_number()==1)
+    
+    df_q3 <- df.match %>% 
+      dplyr::group_by(subclass) %>% 
+      arrange(desc(abs(res1))) %>%
+      arrange(weights) %>%
+      filter(mark=="q3") %>% 
+      filter(row_number()==1)
+    
+    df <- rbind(df_q1,df_q3)
+    
+    df <- df %>% 
+      dplyr::select(subclass,mark,res1,everything()) %>%  
+      dplyr::arrange(.,subclass)
+    
+    
+    write_csv(df,paste0("./output/propensity/",comp_var[j],"_propensity_data.csv"))
+    
+  
+  }
+  
+```
