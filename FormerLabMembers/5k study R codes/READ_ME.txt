@@ -8,7 +8,7 @@ Libraries required to run each script are listed at the beginning of each script
 There are specific installation requirements. 
 
 # DEMO
-Once accepted, input folder will be provided with all necessary files to run the scripts. 
+Input folder provides all necessary files to run the scripts. 
 
 # INSTRCUTIONS FOR USE
-These scripts are not meant to be used with any other datasets - they are one-time scripts usd to analyze our own proteomic dataset. 
+These scripts are not meant to be used with any other datasets - they are one-time scripts used to analyze our own proteomic dataset. 
